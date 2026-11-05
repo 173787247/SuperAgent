@@ -41,5 +41,8 @@ target/
 
 # OS
 .DS_Store
-docs
 docs/td/*
+
+# SuperAgent runtime data (sessions, agent workspaces)
+/data/
+
