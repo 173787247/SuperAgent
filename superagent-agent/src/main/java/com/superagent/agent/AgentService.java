@@ -3,6 +3,7 @@ package com.superagent.agent;
 import com.superagent.agent.chat.ChatService;
 import com.superagent.agent.memory.AgentMemoryService;
 import com.superagent.api.agent.AgentDto;
+import com.superagent.api.agent.AgentMemoryDto;
 import com.superagent.api.agent.AgentMemberDto;
 import com.superagent.api.agent.CreateAgentRequest;
 import com.superagent.api.agent.UpdateAgentRequest;
@@ -16,12 +17,11 @@ import com.superagent.core.agent.AgentMember;
 import com.superagent.core.agent.AgentMemberStore;
 import com.superagent.core.agent.AgentStatus;
 import com.superagent.core.agent.AgentStore;
-import com.superagent.core.inbox.EventSource;
-import com.superagent.core.inbox.EventSourceStore;
 import com.superagent.core.notice.NoticeEvents;
 import com.superagent.core.user.User;
 import com.superagent.core.user.UserStore;
-import com.superagent.knowledge.skill.SkillService;
+import com.superagent.platform.user.PeopleDirectory;
+import com.superagent.skills.SkillService;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,18 +71,18 @@ public class AgentService {
     private final AgentMemberStore members;
     private final ApplicationEventPublisher events;
     private final UserStore users;
-    private final EventSourceStore sources;
+    private final PeopleDirectory people;
     private final String adminUsername;
     private final Object superLock = new Object();
 
     public AgentService(AgentStore store, ChatService chatService, SkillService skills, AgentMemoryService memory,
-                        AgentMemberStore members, UserStore users, EventSourceStore sources,
-                        ApplicationEventPublisher events,
+                        AgentMemberStore members, UserStore users,
+                        ApplicationEventPublisher events, PeopleDirectory people,
                         @Value("${superagent.auth.admin.username:admin}") String adminUsername) {
         this.events = events;
         this.members = members;
         this.users = users;
-        this.sources = sources;
+        this.people = people;
         this.store = store;
         this.chatService = chatService;
         this.skills = skills;
@@ -181,6 +181,11 @@ public class AgentService {
     }
 
     /** The agent if it is the user's and live; throws {@link AgentNotFoundException} otherwise. */
+    /** The agent's name, for labels (null when it's gone). */
+    public String findName(String id) {
+        return store.find(id).map(Agent::name).orElse(null);
+    }
+
     public Agent require(String id, String owner) {
         return store.find(id)
                 .filter(a -> a.status() != AgentStatus.DELETED && Objects.equals(a.owner(), owner))
@@ -250,7 +255,29 @@ public class AgentService {
         return new AgentDto(a.id(), a.name(), a.avatar(), a.character(), a.persona(), a.model(), skills.agentSkillIds(a.id()),
                 a.status().name().toLowerCase(), a.kind().name().toLowerCase(), a.managedBy(), sessionId,
                 a.createdAt(), a.updatedAt(), a.owner(), Objects.equals(a.owner(), viewer) ? "owner" : "collaborator",
-                people, shareable(a));
+                people, shareable(a), a.tier());
+    }
+
+    // --- memory ---
+
+    /** Members may read the agent's memory; only its owner changes it. */
+    public AgentMemoryDto memory(String id, String user) {
+        Agent agent = requireViewer(id, user);
+        return new AgentMemoryDto(memory.read(agent), memory.updatedAt(agent), Objects.equals(agent.owner(), user),
+                memory.distilling(agent.id()));
+    }
+
+    public AgentMemoryDto editMemory(String id, String user, String text) {
+        Agent agent = require(id, user);
+        memory.edit(agent, text, user);
+        return memory(id, user);
+    }
+
+    /** Folds the conversation not in memory yet into it now, in the background. */
+    public AgentMemoryDto distillMemory(String id, String user) {
+        Agent agent = require(id, user);
+        memory.distillNow(agent);
+        return memory(id, user);
     }
 
     // --- collaboration ---
@@ -277,15 +304,11 @@ public class AgentService {
     }
 
     /**
-     * The SuperAgent, the members it hired and the inbox secretary act on one person's private data
-     * (their requests, their messages), so they can't be shared.
+     * Every agent but the SuperAgent can be shared — the ones it hired included. The SuperAgent is the owner's own
+     * leader: it acts on their requests and the messages their data sources receive.
      */
     private boolean shareable(Agent a) {
-        if (a.isSuper() || a.managedBy() != null) {
-            return false;
-        }
-        return sources.find(a.owner(), EventSource.FEISHU).map(EventSource::secretaryAgentId)
-                .map(id -> !id.equals(a.id())).orElse(true);
+        return !a.isSuper();
     }
 
     /** Adds collaborators (owner only). They see the whole history, including what was said before they joined. */
@@ -300,13 +323,23 @@ public class AgentService {
             if (username.isEmpty() || username.equals(owner) || isMember(id, username)) {
                 continue;
             }
-            User user = users.findByUsername(username).filter(User::enabled)
+            User user = people.find(username).filter(User::enabled)
                     .orElseThrow(() -> new IllegalArgumentException("No such user: " + username));
             members.save(new AgentMember(id, user.username(), owner, true, now, now));
             events.publishEvent(new NoticeEvents.AgentShared(id, agent.name(), user.username(), displayName(owner)));
             log.info("agent {} shared by {} with {}", id, owner, username);
         }
         return toDto(agent, chatService.currentSessionId(id), owner);
+    }
+
+    /** Usernames of the agent's active collaborators (the owner isn't one). */
+    public List<String> memberUsernames(String id) {
+        return members.members(id).stream().map(AgentMember::username).toList();
+    }
+
+    /** Whether the owner may share this agent at all (only the SuperAgent can't be). */
+    public boolean canShare(String id, String owner) {
+        return shareable(require(id, owner));
     }
 
     /** The owner removes someone, or a collaborator leaves (username = themselves). */
@@ -324,7 +357,7 @@ public class AgentService {
         if (username == null) {
             return null;
         }
-        return users.findByUsername(username).map(u -> u.displayName() == null || u.displayName().isBlank()
+        return people.find(username).map(u -> u.displayName() == null || u.displayName().isBlank()
                 ? u.username() : u.displayName()).orElse(username);
     }
 }

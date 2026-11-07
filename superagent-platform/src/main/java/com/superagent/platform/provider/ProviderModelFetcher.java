@@ -62,18 +62,53 @@ public class ProviderModelFetcher {
 
     /** Fetches the model list for a catalogue key; throws with a readable message on failure. */
     public Result fetch(String providerKey) throws IOException, InterruptedException {
+        return fetch(providerKey, null);
+    }
+
+    /** The list as seen through {@code credential} (a relay may offer other models); null = the server's environment. */
+    public Result fetch(String providerKey, com.superagent.core.chat.RunCredential credential)
+            throws IOException, InterruptedException {
         return switch (providerKey) {
-            case "codex" -> fetchCodex();
-            case "claude" -> fetchClaude();
+            case "codex" -> fetchCodex(credential);
+            case "claude" -> fetchClaude(credential);
+            case "deepseek", "glm", "kimi", "qwen" -> fetchVendor(providerKey, credential);
             default -> throw new IOException("Model listing is not available for " + providerKey + " yet");
         };
     }
 
+    // --- the vendors reached by key: their OpenAI-style model list ---
+
+    private Result fetchVendor(String providerKey, com.superagent.core.chat.RunCredential credential)
+            throws IOException, InterruptedException {
+        var entry = com.superagent.core.provider.ProviderCatalog.find(providerKey).orElseThrow();
+        ApiAccess access = ApiAccess.of(entry, credential).orElseThrow(() -> new IOException("请先在 API Key 页配置 Key"));
+        String url = access.modelsUrl(providerKey);
+        HttpResponse<String> resp = http.send(access.authorizeBearer(HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(20)).GET()).build(), HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("GET " + url + " returned HTTP " + resp.statusCode());
+        }
+        List<ProviderModelDto> out = new ArrayList<>();
+        for (JsonNode m : mapper.readTree(resp.body()).path("data")) {
+            String id = m.path("id").asText("");
+            if (!id.isBlank() && !NON_CHAT.matcher(id).find()) {
+                out.add(new ProviderModelDto(id, null, List.of(), null, "none", null, true));
+            }
+        }
+        out.sort(Comparator.comparing(ProviderModelDto::id));
+        return new Result(out, "GET " + url);
+    }
+
     // --- codex ---
 
-    private Result fetchCodex() throws IOException, InterruptedException {
+    private Result fetchCodex(com.superagent.core.chat.RunCredential credential) throws IOException, InterruptedException {
         Path codex = probe.findBinary("codex").orElseThrow(() -> new IOException("codex is not installed"));
-        JsonNode root = mapper.readTree(run(List.of(codex.toString(), "debug", "models"), 60));
+        List<String> argv = new ArrayList<>(List.of(codex.toString(), "debug", "models"));
+        if (credential != null) {
+            // Like a run: a hand-set provider in the machine's config.toml (or a broken one) mustn't decide the list.
+            argv.addAll(List.of("-c", "model_provider=\"openai\""));
+        }
+        JsonNode root = mapper.readTree(run(argv, 60));
         List<ProviderModelDto> out = new ArrayList<>();
         for (JsonNode m : root.path("models")) {
             if ("hide".equals(m.path("visibility").asText())) {
@@ -100,15 +135,11 @@ public class ProviderModelFetcher {
 
     // --- claude ---
 
-    private Result fetchClaude() throws IOException, InterruptedException {
-        String apiKey = System.getenv("ANTHROPIC_API_KEY");
-        String authToken = System.getenv("ANTHROPIC_AUTH_TOKEN");
-        String base = System.getenv("ANTHROPIC_BASE_URL");
-        boolean viaGateway = base != null && !base.isBlank();
-        base = viaGateway ? base.replaceAll("/+$", "") : "https://api.anthropic.com";
+    private Result fetchClaude(com.superagent.core.chat.RunCredential credential) throws IOException, InterruptedException {
+        java.util.Optional<ApiAccess> access = ApiAccess.anthropic(credential);
         List<String> cliEfforts = claudeCliEfforts();
 
-        if (blank(apiKey) && blank(authToken)) {
+        if (access.isEmpty()) {
             // Subscription (OAuth) login: no key to list the account's models with. The CLI's
             // documented aliases still work; say so rather than inventing a list.
             List<ProviderModelDto> aliases = new ArrayList<>();
@@ -119,6 +150,8 @@ public class ProviderModelFetcher {
             return new Result(aliases, "claude --help aliases (no API key in the server environment)");
         }
 
+        String base = access.get().base();
+        boolean viaGateway = access.get().viaGateway();
         List<ProviderModelDto> out = new ArrayList<>();
         String afterId = null;
         for (int page = 0; page < MAX_PAGES; page++) {
@@ -128,11 +161,7 @@ public class ProviderModelFetcher {
                     .timeout(Duration.ofSeconds(20))
                     .header("anthropic-version", "2023-06-01")
                     .GET();
-            if (!blank(apiKey)) {
-                req.header("x-api-key", apiKey);
-            } else {
-                req.header("Authorization", "Bearer " + authToken);
-            }
+            access.get().authorize(req);
             HttpResponse<String> resp = http.send(req.build(), HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) {
                 throw new IOException("GET /v1/models returned HTTP " + resp.statusCode());

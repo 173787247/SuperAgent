@@ -20,7 +20,7 @@ public class MysqlTaskStore extends AbstractJdbcTaskStore {
               flow          VARCHAR(255),
               status        VARCHAR(32)   NOT NULL,
               progress      INT           NOT NULL DEFAULT 0,
-              spend         DECIMAL(12,2) NOT NULL DEFAULT 0,
+              spend         DECIMAL(16,6) NOT NULL DEFAULT 0,
               model         VARCHAR(128),
               agent_type    VARCHAR(32)   NOT NULL,
               workspace_dir VARCHAR(1024),
@@ -37,6 +37,25 @@ public class MysqlTaskStore extends AbstractJdbcTaskStore {
 
     public MysqlTaskStore(JdbcTemplate jdbc) {
         super(jdbc, SCHEMA);
+        ensureTier();
+        ensureSpendPrecision();
+    }
+
+    /** Cents were too coarse: one small task costs a fraction of a cent, which showed as $0.00. */
+    private void ensureSpendPrecision() {
+        Integer scale = jdbc.queryForObject("SELECT MAX(numeric_scale) FROM information_schema.columns WHERE table_schema = SCHEMA() "
+                + "AND LOWER(table_name) = 'task' AND LOWER(column_name) = 'spend'", Integer.class);
+        if (scale != null && scale < 6) {
+            jdbc.execute("ALTER TABLE task MODIFY spend DECIMAL(16,6) NOT NULL DEFAULT 0");
+        }
+    }
+
+    private void ensureTier() {
+        Integer present = jdbc.queryForObject("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = SCHEMA() "
+                + "AND LOWER(table_name) = 'task' AND LOWER(column_name) = 'tier'", Integer.class);
+        if (present == null || present == 0) {
+            jdbc.execute("ALTER TABLE task ADD COLUMN tier VARCHAR(16)"); // older tables don't get it from CREATE TABLE IF NOT EXISTS
+        }
     }
 
     @Override
@@ -46,13 +65,13 @@ public class MysqlTaskStore extends AbstractJdbcTaskStore {
 
     @Override
     public Task save(Task t) {
-        jdbc.update("INSERT INTO task " + COLUMNS + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        jdbc.update("INSERT INTO task " + COLUMNS + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                         + "ON DUPLICATE KEY UPDATE title=VALUES(title), brief=VALUES(brief), source=VALUES(source), "
                         + "repo=VALUES(repo), branch=VALUES(branch), flow=VALUES(flow), status=VALUES(status), "
                         + "progress=VALUES(progress), spend=VALUES(spend), model=VALUES(model), "
                         + "agent_type=VALUES(agent_type), workspace_dir=VALUES(workspace_dir), "
                         + "created_by=VALUES(created_by), error=VALUES(error), started_at=VALUES(started_at), "
-                        + "finished_at=VALUES(finished_at), updated_at=VALUES(updated_at)",
+                        + "finished_at=VALUES(finished_at), updated_at=VALUES(updated_at), tier=VALUES(tier)",
                 params(t));
         return t;
     }

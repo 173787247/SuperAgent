@@ -24,15 +24,15 @@ class SettingsServiceTest {
     /** Provider double: only the given models passed the inference check, under codex if prefixed "gpt". */
     private static final class FakeProviders extends ProviderService {
         private final Set<String> healthy;
-        FakeProviders(String... healthy) { super(null, null, null, null); this.healthy = Set.of(healthy); }
+        FakeProviders(String... healthy) { super(null, null, null, null, null, null); this.healthy = Set.of(healthy); }
         @Override public Optional<String> cliFor(String modelId) {
             return healthy.contains(modelId)
                     ? Optional.of(modelId.startsWith("gpt") ? "codex" : "claude") : Optional.empty();
         }
     }
 
-    private final SettingsService service =
-            new SettingsService(new InMemoryStore(), new FakeProviders("claude-opus-5-5", "gpt-5.5"));
+    private final InMemoryStore store = new InMemoryStore();
+    private final SettingsService service = new SettingsService(store, new FakeProviders("claude-opus-5-5", "gpt-5.5"));
 
     @Test
     void unsetByDefault() {
@@ -60,5 +60,22 @@ class SettingsServiceTest {
         assertThatThrownBy(() -> service.update(new SystemSettingsDto("claude-listed-only", null, null)))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThat(service.agentDefaultModel()).isNull();
+
+        // A saved default that has since failed its check doesn't stop the other settings being saved.
+        store.put(SettingsService.AGENT_DEFAULT_MODEL, "claude-gone");
+        assertThat(service.update(new SystemSettingsDto("claude-gone", "OKG", null)).companyName()).isEqualTo("OKG");
+    }
+
+    @Test
+    void thePublicAddressIsCheckedTidiedAndKeptUnlessChanged() {
+        assertThat(service.publicUrl()).isNull();
+        assertThat(service.update(new SystemSettingsDto(null, null, null, " https://ai.example.com/ ")).publicUrl())
+                .isEqualTo("https://ai.example.com");
+        assertThat(service.update(new SystemSettingsDto(null, "OKG", null)).publicUrl()).isEqualTo("https://ai.example.com");
+        for (String bad : new String[]{"ai.example.com", "ftp://ai.example.com", "https://ai.example.com/?a=1", "https://"}) {
+            assertThatThrownBy(() -> service.update(new SystemSettingsDto(null, null, null, bad)))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThat(service.update(new SystemSettingsDto(null, null, null, "")).publicUrl()).isNull();
     }
 }

@@ -1,5 +1,6 @@
 package com.superagent.orchestrator;
 
+import com.superagent.platform.provider.CredentialService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -8,7 +9,6 @@ import com.superagent.agent.chat.ChatService;
 import com.superagent.agent.log.AgentLogService;
 import com.superagent.agent.memory.AgentMemoryService;
 import com.superagent.api.agent.UpdateAgentRequest;
-import com.superagent.api.chat.ImageUploadDto;
 import com.superagent.api.superagent.SuperAgentPlanDto;
 import com.superagent.api.superagent.SuperAgentStateDto;
 import com.superagent.api.superagent.SuperAgentWorkDto;
@@ -30,17 +30,14 @@ import com.superagent.core.chat.Cancellation;
 import com.superagent.core.chat.ChatMessage;
 import com.superagent.core.chat.ChatSession;
 import com.superagent.core.chat.ChatStore;
-import com.superagent.core.chat.ImageAttachment;
 import com.superagent.core.chat.MessageRole;
-import com.superagent.core.chat.SessionStatus;
 import com.superagent.core.notice.NoticeEvents;
 import com.superagent.core.task.Task;
 import com.superagent.core.task.TaskStatus;
 import com.superagent.core.task.TaskStore;
-import com.superagent.knowledge.skill.SkillService;
+import com.superagent.skills.SkillService;
 import com.superagent.platform.provider.ProviderService;
 import com.superagent.platform.settings.SettingsService;
-import com.superagent.runtime.attachment.ImageAttachmentStore;
 import com.superagent.runtime.mcp.McpGrants;
 import com.superagent.task.TaskService;
 import jakarta.annotation.PreDestroy;
@@ -77,24 +74,24 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Each user's SuperAgent: a leader that takes requests through an inbox instead of answering live.
+ * Each user's SuperAgent, in two parts that never share a conversation.
  *
- * <p><b>Inbox and rounds.</b> Messages land in the SuperAgent's chat session at once. The loop
- * ({@link SuperAgentLoop}) checks every few seconds; once new input has gone quiet for
- * {@code quiet} (or has waited {@code max-wait}, so a steady stream still gets answered), everything
- * since the last round is handed to the agent as one batch. One round at a time per user; anything
- * arriving meanwhile goes to the next round. {@link SuperAgentState#processedUntil()} is the cursor.
+ * <p><b>The chat.</b> The user talks with it live, like any agent ({@link SuperAgentChat} gives those turns its
+ * character and team tools); it answers and acts right there.
  *
- * <p><b>Plan first.</b> The agent proposes a plan (who on the team does what). Hiring, re-briefing
- * members and assigning tasks are refused until the user approves that plan in the UI — enforced
- * here, not just asked of the model.
+ * <p><b>The background.</b> What arrives on its own — task results, messages the user's data sources receive — is
+ * queued in a session of its own ({@link #backgroundSession}). The loop ({@link SuperAgentLoop}) checks every few
+ * seconds; once new input has gone quiet for {@code quiet} (or has waited {@code max-wait}), everything since the
+ * last round is handed to a background run as one batch, one round at a time per user.
+ * {@link SuperAgentState#processedUntil()} is the cursor. What the user needs to know the round posts into the
+ * chat (tell_user, marked as coming from the background); the rest stays in the background record.
  *
- * <p><b>Closing the loop.</b> Tasks it assigns are tracked; when one finishes, fails, or needs a
- * decision, a system message lands in the inbox and the next round reports it to the user.
+ * <p><b>Plan first.</b> Hiring, re-briefing members and assigning tasks are refused until the user approves the
+ * latest plan in the UI — enforced here, not just asked of the model.
  *
- * <p><b>The outside world.</b> Messages the user's data sources receive (Feishu, ...) are delivered here too
- * ({@link #deliverExternal}), marked as third-party data. They're worked in rounds of their own, with only
- * the inbox and read-only tools: text from strangers never runs in a round that may hire, assign or reply.
+ * <p><b>The outside world.</b> Received messages ({@link #deliverExternal}) are marked as third-party data and
+ * worked in rounds of their own, which can't hire, assign or reply to tasks: text from strangers never runs where
+ * it could act.
  */
 @Service
 public class SuperAgentService {
@@ -103,15 +100,27 @@ public class SuperAgentService {
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("MM-dd HH:mm", Locale.ROOT);
     private static final int REPORT_CHARS = 1500;
 
-    /** Tool names as the CLI sees them; a round may call these and nothing else. */
-    static final List<String> ROUND_TOOLS = Stream.concat(
+    /** Tool names as the CLI sees them; a background round may call these and nothing else. */
+    static final List<String> BACKGROUND_TOOLS = Stream.concat(
             SuperAgentTools.NAMES.stream().map(n -> "mcp__superagent__" + n), McpGrants.INBOX_TOOLS.stream()).toList();
+    /**
+     * The chat answers the user directly, so it has no use for posting into its own conversation; it alone manages
+     * collaborators, works on files and starts tasks directly (a background round reads third-party messages, which must not bring people
+     * in or touch anyone's files).
+     */
+    static final List<String> CHAT_TOOLS = Stream.concat(BACKGROUND_TOOLS.stream()
+            .filter(t -> !t.equals("mcp__superagent__" + SuperAgentTools.TELL_USER)),
+            Stream.of(SuperAgentCollabTools.TOOLS, SuperAgentTaskTools.TOOLS, McpGrants.SUPER_FILE_TOOLS, McpGrants.SKILL_TOOLS,
+                    McpGrants.SKILL_CHAT_TOOLS, com.superagent.agent.AgentSkillMcpTools.TOOLS).flatMap(List::stream)).toList();
 
     /** Marks a delivery of received messages; such rounds can't touch the team or its tasks. */
     static final String EXTERNAL = "【外部消息】";
-    private static final Set<String> ACTING_TOOLS = Set.of("hire_member", "update_member", "assign_task", "reply_task");
-    static final List<String> EXTERNAL_ROUND_TOOLS = ROUND_TOOLS.stream()
+    static final Set<String> ACTING_TOOLS = Set.of("hire_member", "update_member", "assign_task", "reply_task");
+    static final List<String> EXTERNAL_ROUND_TOOLS = BACKGROUND_TOOLS.stream()
             .filter(t -> !ACTING_TOOLS.contains(t.substring("mcp__superagent__".length()))).toList();
+
+    /** The author of what the background posts into the chat, so the page can mark it and the chat can see it. */
+    public static final String BACKGROUND_AUTHOR = "superagent:background";
 
     /** A task the SuperAgent assigned; {@code reported} is the last status it told the user about. */
     /** Recognizes a task the SuperAgent assigned (its brief opens with this), to back-fill the work record. */
@@ -129,7 +138,6 @@ public class SuperAgentService {
     private final TaskStore tasks;
     private final ProviderService providers;
     private final SettingsService settings;
-    private final ImageAttachmentStore images;
     private final McpGrants grants;
     private final ChatService chatService;
     private final AgentMemoryService memory;
@@ -137,7 +145,22 @@ public class SuperAgentService {
     private final AgentLogService runLog;
     private final ApplicationEventPublisher events;
     private final SkillService skills;
+    private final com.superagent.agent.AgentInviteService inviteService;
     private final Map<AgentType, AgentRunner> runners = new EnumMap<>(AgentType.class);
+    private com.superagent.core.usage.UsageRecorder usage; // null in tests: tokens aren't kept
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setUsageRecorder(com.superagent.core.usage.UsageRecorder usage) {
+        this.usage = usage;
+    }
+
+    private CredentialService credentials; // null in tests: runs use the server's environment
+
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setCredentials(CredentialService credentials) {
+        this.credentials = credentials;
+    }
     private final Duration quiet;
     private final Duration maxWait;
     private final int teamLimit;
@@ -145,11 +168,14 @@ public class SuperAgentService {
 
     private final ObjectMapper json = new ObjectMapper().registerModule(new JavaTimeModule());
     private final Object stateLock = new Object();
-    /** owner → cutoff of the round running for them. */
+    /** owner → cutoff of the background round running for them. */
     private final Map<String, Instant> running = new ConcurrentHashMap<>();
-    /** Owners whose current round works received messages: it may not touch the team or its tasks. */
-    private final Set<String> externalRound = ConcurrentHashMap.newKeySet();
-    /** Owners whose next round should start without waiting for quiet (they just approved a plan). */
+    /**
+     * MCP grants of background rounds, by token → whether the round works received messages (then it may not
+     * touch the team or its tasks). Per run, not per user: the chat may act while the background reads.
+     */
+    private final Map<String, Boolean> backgroundGrants = new ConcurrentHashMap<>();
+    /** Owners whose next background round should start without waiting for quiet (an urgent delivery). */
     private final Set<String> immediate = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "superagent-round");
@@ -159,7 +185,7 @@ public class SuperAgentService {
 
     public SuperAgentService(AgentService agents, SuperAgentStateStore states, ChatStore chats, TaskService taskService,
                              TaskStore tasks, ProviderService providers, SettingsService settings,
-                             ImageAttachmentStore images, McpGrants grants, SkillService skills,
+                             McpGrants grants, SkillService skills, com.superagent.agent.AgentInviteService inviteService,
                              ChatService chatService, AgentMemoryService memory, SuperAgentWorkStore works,
                              AgentLogService runLog, ApplicationEventPublisher events,
                              List<AgentRunner> agentRunners,
@@ -175,13 +201,13 @@ public class SuperAgentService {
         this.tasks = tasks;
         this.providers = providers;
         this.settings = settings;
-        this.images = images;
         this.grants = grants;
         this.chatService = chatService;
         this.memory = memory;
         this.works = works;
         this.runLog = runLog;
         this.skills = skills;
+        this.inviteService = inviteService;
         for (AgentRunner r : agentRunners) {
             runners.put(r.type(), r);
         }
@@ -201,27 +227,13 @@ public class SuperAgentService {
                 plan(s), team(owner, sa).size(), teamLimit);
     }
 
-    /** Drops a message into the inbox; it is worked through in the next round. */
-    public SuperAgentStateDto submit(String owner, String content, List<ImageUploadDto> uploads) {
-        SuperAgentState s = ensureState(owner);
-        String sessionId = sessionId(agents.require(s.agentId(), owner));
-        String id = UUID.randomUUID().toString();
-        List<ImageAttachment> attached = images.save(sessionId, id, uploads);
-        String text = content == null ? "" : content.strip();
-        if (text.isEmpty() && attached.isEmpty()) {
-            throw new IllegalArgumentException("Message is empty");
-        }
-        chats.appendMessage(new ChatMessage(id, sessionId, MessageRole.USER, text, Instant.now()));
-        return state(owner);
-    }
-
     /**
      * Received messages for the owner's SuperAgent; an urgent delivery starts a round right away. The text says
      * what kind of batch it is and lists the messages as quoted data.
      */
     public void deliverExternal(String owner, String text, boolean urgent) {
         SuperAgentState s = ensureState(owner);
-        note(sessionId(agents.require(s.agentId(), owner)), EXTERNAL + text);
+        note(backgroundSession(agents.require(s.agentId(), owner)).id(), EXTERNAL + text);
         if (urgent) {
             immediate.add(owner);
         }
@@ -231,7 +243,7 @@ public class SuperAgentService {
         return m.role() == MessageRole.SYSTEM && m.content().startsWith(EXTERNAL);
     }
 
-    /** The user approves the latest plan: the next round may hire and assign, and starts right away. */
+    /** The user approves the latest plan: hiring and assigning are unlocked; the page carries on in the chat. */
     public SuperAgentStateDto approvePlan(String owner, String planId) {
         synchronized (stateLock) {
             SuperAgentState s = ensureState(owner);
@@ -240,9 +252,7 @@ public class SuperAgentService {
             }
             states.save(s.withPlan(s.planId(), SuperAgentState.PLAN_APPROVED, s.planJson()));
             events.publishEvent(new NoticeEvents.PlanChanged(owner, planId, null, false));
-            note(sessionId(agents.require(s.agentId(), owner)), "用户已确认计划，请开始执行。");
             logSuper(owner, "info", "你确认了计划 #" + planId + "，开始执行", null);
-            immediate.add(owner);
         }
         return state(owner);
     }
@@ -282,16 +292,15 @@ public class SuperAgentService {
             return;
         }
         Agent sa = agents.findSuperAgent(owner).orElse(null);
-        String sessionId = sa == null ? null : sessionId(sa);
-        if (sessionId == null) {
+        if (sa == null) {
             return;
         }
-        List<ChatMessage> all = SuperAgentInbox.pending(agentMessages(sa.id()), s.processedUntil());
+        List<ChatMessage> all = SuperAgentInbox.pending(chats.listMessages(backgroundSession(sa).id()), s.processedUntil());
         if (!SuperAgentInbox.due(all, now, quiet, maxWait, immediate.contains(owner))) {
             return;
         }
         immediate.remove(owner);
-        // Received messages and the user's own input never share a round (see the class comment).
+        // Received messages and the system's own notes never share a round (see the class comment).
         boolean external = external(all.get(0));
         List<ChatMessage> pending = all.stream().takeWhile(m -> external(m) == external).toList();
         if (pending.size() < all.size()) {
@@ -302,13 +311,9 @@ public class SuperAgentService {
             return;
         }
         executor.execute(() -> {
-            if (external) {
-                externalRound.add(owner);
-            }
             try {
                 runRound(owner, sa, pending, last);
             } finally {
-                externalRound.remove(owner);
                 running.remove(owner);
             }
         });
@@ -322,50 +327,34 @@ public class SuperAgentService {
     }
 
     /**
-     * Works one batch. Like any agent's turn: if it fails and that tips the session over its failure limit
-     * (network trouble never counts), the SuperAgent moves to a fresh session and tries the batch once more.
-     * The reply — or why the round failed — goes into the conversation either way, and the cursor moves on,
-     * so a broken batch can't be retried forever.
+     * Works one batch in the background session — its own CLI conversation, apart from the chat. What the user
+     * needs to know it posts into the chat itself (tell_user); the round's reply stays in the background record.
+     * A failed round starts the next one on a fresh CLI conversation. The cursor moves on either way, so a broken
+     * batch can't be retried forever.
      */
     private void runRound(String owner, Agent sa, List<ChatMessage> batch, Instant cutoff) {
         long startedAt = System.currentTimeMillis();
-        String model = sa.model() != null ? sa.model() : settings.agentDefaultModel();
-        // Like any agent: a new model means a new session, which starts from the SuperAgent's memory.
-        ChatSession session = chatService.sessionForTurn(sa, model);
+        // Like the chat, on the admin's default model: it thinks and hands out work.
+        String model = settings.agentDefaultModel();
+        ChatSession session = backgroundSession(sa);
         String replyId = UUID.randomUUID().toString();
-        // The batch is this round's input already; the "recent conversation" is what came before it.
-        Set<String> batchIds = batch.stream().map(ChatMessage::id).collect(Collectors.toSet());
-        String context = session.agentSessionId() == null ? memory.context(sa, batchIds) : memory.read(sa);
-        RoundAttempt attempt = attemptRound(owner, sa, session, model, batch, context, replyId);
-        if (!attempt.failed()) {
-            memory.recordSuccess(sa);
-        } else if (memory.recordFailure(sa, attempt.error())) {
-            attempt = attemptRound(owner, sa, chatService.rotateSession(sa), model, batch,
-                    memory.context(sa, batchIds), replyId);
-            if (attempt.failed()) {
-                memory.recordFailure(sa, attempt.error());
-            } else {
-                memory.recordSuccess(sa);
-            }
-        }
+        RoundAttempt attempt = attemptRound(owner, sa, session, model, batch, memory.read(sa), replyId);
         String reply = attempt.failed() ? "（本轮处理失败：" + attempt.error() + "）" : attempt.text();
-        String round = "处理 " + batch.size() + " 条输入 · 模型 " + (model == null ? "默认模型" : model) + " · 用时 "
+        String round = "后台处理 " + batch.size() + " 条输入 · 模型 " + (model == null ? "默认模型" : model) + " · 用时 "
                 + String.format("%.1fs", (System.currentTimeMillis() - startedAt) / 1000.0);
         if (attempt.failed()) {
-            runLog.error(sa, AgentLogService.SUPERAGENT, "一轮处理失败 · " + round, attempt.error());
+            runLog.error(sa, AgentLogService.SUPERAGENT, "一轮后台处理失败 · " + round, attempt.error());
         } else {
-            runLog.info(sa, AgentLogService.SUPERAGENT, "完成一轮 · " + round, null);
+            runLog.info(sa, AgentLogService.SUPERAGENT, "完成一轮后台处理 · " + round, null);
         }
-        ChatSession used = attempt.session();
-        chats.appendMessage(new ChatMessage(replyId, used.id(), MessageRole.ASSISTANT, reply, Instant.now()));
-        chats.updateSession(attempt.type() != used.agentType()
-                ? new ChatSession(used.id(), used.title(), attempt.type(), attempt.agentSessionId(), used.workspaceDir(),
-                used.agentId(), used.status(), used.createdAt(), Instant.now())
-                : used.withAgentSessionId(attempt.agentSessionId()));
+        chats.appendMessage(new ChatMessage(replyId, session.id(), MessageRole.ASSISTANT, reply, Instant.now()));
+        String nextConversation = attempt.failed() ? null : attempt.agentSessionId();
+        chats.updateSession(new ChatSession(session.id(), session.title(), attempt.type(), nextConversation,
+                session.workspaceDir(), null, session.status(), session.createdAt(), Instant.now()));
         synchronized (stateLock) {
             states.find(owner).ifPresent(s -> states.save(s.processedTo(cutoff)));
         }
-        log.info("superagent round for {} handled {} message(s)", owner, batch.size());
+        log.info("superagent background round for {} handled {} message(s)", owner, batch.size());
     }
 
     private RoundAttempt attemptRound(String owner, Agent sa, ChatSession session, String model, List<ChatMessage> batch,
@@ -395,21 +384,29 @@ public class SuperAgentService {
                 default -> { /* thinking / tool use are kept as events only */ }
             }
         };
-        List<ImageAttachment> attached = new ArrayList<>();
-        batch.stream().filter(m -> m.role() == MessageRole.USER)
-                .forEach(m -> attached.addAll(images.list(m.sessionId(), m.id())));
+        boolean external = external(batch.get(0));
         McpGrants.Grant grant = grants.available() ? grants.openSuper(owner, sa.id(), session.workspaceDir()) : null;
+        if (grant != null) {
+            backgroundGrants.put(grant.token(), external);
+        }
         try {
             if (runner == null) {
                 throw new IllegalStateException("No runner for " + type);
             }
             runner.run(new AgentRunRequest(session.id(), agentSessionId, session.workspaceDir(), roundPrompt(owner, batch),
-                    model, external(batch.get(0)) ? EXTERNAL_ROUND_TOOLS : ROUND_TOOLS, false, grant == null ? null : grants.mcpConfig(grant),
-                    SuperAgentPrompts.system(teamLimit), attached, context), sink, new Cancellation());
+                    model, external ? EXTERNAL_ROUND_TOOLS : BACKGROUND_TOOLS, false, grant == null ? null : grants.mcpConfig(grant),
+                    SuperAgentPrompts.background(teamLimit), List.of(), context,
+                    credentials == null ? null : credentials.current(type.cliName()).credential()),
+                    com.superagent.core.usage.UsageRecorder.tap(usage, new com.superagent.core.usage.UsageContext(owner,
+                            com.superagent.core.usage.UsageContext.SOURCE_BACKGROUND, sa.id(), null, session.id(), type.cliName()),
+                            sink), new Cancellation());
         } catch (RuntimeException e) {
             log.warn("superagent round attempt failed for {}: {}", owner, e.getMessage());
             error.set(e.getMessage() != null ? e.getMessage() : "round failed");
         } finally {
+            if (grant != null) {
+                backgroundGrants.remove(grant.token());
+            }
             grants.close(grant);
         }
         String out = result.get() != null ? result.get() : text.toString();
@@ -419,12 +416,16 @@ public class SuperAgentService {
     private String roundPrompt(String owner, List<ChatMessage> batch) {
         StringBuilder sb = new StringBuilder("## 新输入（自上一轮以来，按时间顺序）\n");
         for (ChatMessage m : batch) {
-            sb.append("- [").append(STAMP.format(m.createdAt().atZone(zone))).append("] ")
-                    .append(m.role() == MessageRole.USER ? "用户：" : "系统：")
-                    .append(m.content().isBlank() ? "（见附图）" : m.content()).append("\n");
+            sb.append("- [").append(STAMP.format(m.createdAt().atZone(zone))).append("] ").append(m.content()).append("\n");
         }
+        return sb.append("\n").append(statusLines(owner)).toString();
+    }
+
+    /** Where things stand, for a round or a chat turn: the plan and the team. */
+    String statusLines(String owner) {
+        StringBuilder sb = new StringBuilder();
         SuperAgentState s = states.find(owner).orElseThrow();
-        sb.append("\n## 当前状态\n- 计划：");
+        sb.append("## 当前状态\n- 计划：");
         if (s.planId() == null) {
             sb.append("无");
         } else if (SuperAgentState.PLAN_APPROVED.equals(s.planStatus())) {
@@ -451,7 +452,7 @@ public class SuperAgentService {
             if (open.isEmpty()) {
                 return;
             }
-            String sessionId = sessionId(agents.require(s.agentId(), owner));
+            String sessionId = backgroundSession(agents.require(s.agentId(), owner)).id();
             for (SuperAgentWork w : open) {
                 Optional<Task> task = tasks.findTask(w.taskId());
                 TaskStatus status = task.map(Task::status).orElse(TaskStatus.DELETED);
@@ -594,35 +595,65 @@ public class SuperAgentService {
         return member(owner, memberId);
     }
 
-    /** Starts a task run by {@code memberId} (their character leads the brief; their skills and model apply). */
+    /** Starts a task run by {@code memberId} under a confirmed plan. */
     String assign(String owner, String memberId, String title, String brief) {
+        return assign(owner, memberId, title, brief, null, null);
+    }
+
+    /** {@code messageId}: the chat reply that hands it out, for its card there (null from a background round). */
+    String assign(String owner, String memberId, String title, String brief, String messageId, String kind) {
         requireApproved(owner);
+        return dispatch(owner, member(owner, memberId), title, brief, messageId, kind);
+    }
+
+    /** Starts what the user just agreed to in the chat: by a member if one was named, else on its own. */
+    String startTask(String owner, String memberId, String title, String brief) {
+        return startTask(owner, memberId, title, brief, null, null);
+    }
+
+    /** {@code kind}: coding or general (null = general unless it names a repository, see TaskService). */
+    String startTask(String owner, String memberId, String title, String brief, String messageId, String kind) {
+        return dispatch(owner, memberId == null || memberId.isBlank() ? null : member(owner, memberId), title, brief,
+                messageId, kind);
+    }
+
+    private String dispatch(String owner, Agent m, String title, String brief, String messageId, String kind) {
         if (title == null || title.isBlank() || brief == null || brief.isBlank()) {
             throw new IllegalArgumentException("A task needs a title and a brief");
         }
-        Agent m = member(owner, memberId);
-        String model = m.model() != null ? m.model() : settings.agentDefaultModel();
-        String character = AgentCharacters.systemPrompt(m);
-        String fullBrief = "你是团队成员「" + m.name() + "」，由 SuperAgent 分派本任务。"
-                + (character == null ? "" : "\n\n## 你的角色\n" + character)
-                + "\n\n## 任务\n" + brief.strip()
+        String model = settings.agentDefaultModel(); // a stand-in: the task's model is chosen for it before it runs
+        // The member's character and memory ride along with the task itself (TaskDoers), not in the brief.
+        String fullBrief = (m == null ? "" : "你是团队成员「" + m.name() + "」，由 SuperAgent 分派本任务。\n\n")
+                + "## 任务\n" + brief.strip()
                 + "\n\n完成后给出简明的交付总结，说明产出放在哪里。";
+        // A member hears about it in its own chat: a short note that it took the task on (the task's card goes under
+        // it), and later the result, as for the tasks it sets off itself.
+        String memberSession = m == null ? null : chatService.currentSessionId(m.id());
+        String noteId = memberSession == null ? null : UUID.randomUUID().toString();
         String taskId = taskService.create(new CreateTaskRequest(title.strip(), fullBrief, "web_chat", null, null, null,
-                model, providers.cliFor(model).orElse(null), null), owner, m.id()).id();
+                model, providers.cliFor(model).orElse(null), kind, null), owner, m == null ? null : m.id(),
+                memberSession, noteId).id();
+        if (noteId != null) {
+            chats.appendMessage(new ChatMessage(noteId, memberSession, MessageRole.ASSISTANT,
+                    "收到 SuperAgent 分派的任务「" + title.strip() + "」，开始执行。完成后结果会发在这里。",
+                    Instant.now(), com.superagent.agent.chat.ChatTaskResults.AUTHOR_PREFIX + taskId));
+        }
+        // A task with no member is still tracked under the SuperAgent, so its result comes back the same way.
+        String doerId = m != null ? m.id() : ensureState(owner).agentId();
+        String doer = m != null ? m.name() : "独立任务";
         synchronized (stateLock) {
             Instant now = Instant.now();
-            works.save(new SuperAgentWork(taskId, owner, ensureState(owner).planId(), title.strip(), m.id(), m.name(),
-                    SuperAgentWork.RUNNING, null, now, null, now));
-            event(taskId, owner, "assigned", "派给 " + m.name());
-            logSuper(owner, "info", "派出任务「" + title.strip() + "」给「" + m.name() + "」", "任务 " + taskId);
+            works.save(new SuperAgentWork(taskId, owner, ensureState(owner).planId(), title.strip(), doerId, doer,
+                    SuperAgentWork.RUNNING, null, now, null, now, messageId));
+            event(taskId, owner, "assigned", "派给 " + doer);
+            logSuper(owner, "info", "派出任务「" + title.strip() + "」给「" + doer + "」", "任务 " + taskId);
         }
-        log.info("superagent of {} assigned task {} to {}", owner, taskId, m.name());
+        log.info("superagent of {} assigned task {} to {}", owner, taskId, doer);
         return taskId;
     }
 
     /** Answers a task it assigned that is waiting for a decision. */
     void replyToTask(String owner, String taskId, String content) {
-        requireOwnInput(owner);
         if (works.find(taskId).filter(w -> w.owner().equals(owner)).isEmpty()) {
             throw new IllegalArgumentException("Not a task you assigned: " + taskId);
         }
@@ -646,6 +677,7 @@ public class SuperAgentService {
     public List<SuperAgentWorkDto> work(String owner, String status, String memberId, int limit) {
         Map<String, String> avatars = new HashMap<>();
         agents.owned(owner).forEach(a -> avatars.put(a.id(), a.avatar()));
+        Agent sa = agents.ensureSuperAgent(owner); // independent tasks are tracked under it: they have no member
         boolean finishedOnly = "finished".equals(status);
         return works.list(owner).stream()
                 .filter(w -> status == null || status.isBlank() || "all".equals(status)
@@ -656,7 +688,8 @@ public class SuperAgentService {
                         : Comparator.comparing(SuperAgentWork::assignedAt, Comparator.reverseOrder()))
                 .limit(Math.max(1, Math.min(limit, 500)))
                 .map(w -> new SuperAgentWorkDto(w.taskId(), w.planId(), w.title(), w.memberId(), w.memberName(),
-                        avatars.get(w.memberId()), w.status(), w.summary(), w.assignedAt(), w.finishedAt()))
+                        avatars.get(w.memberId()), w.status(), w.summary(), w.assignedAt(), w.finishedAt(), w.messageId(),
+                        w.memberId() != null && !w.memberId().equals(sa.id())))
                 .toList();
     }
 
@@ -704,14 +737,73 @@ public class SuperAgentService {
         return tasks.findTask(taskId).filter(t -> Objects.equals(t.createdBy(), owner));
     }
 
-    private void requireOwnInput(String owner) {
-        if (externalRound.contains(owner)) {
+    /** The grant belongs to a background round (not the chat). */
+    boolean isBackground(McpGrants.Grant grant) {
+        return backgroundGrants.containsKey(grant.token());
+    }
+
+    /** Invitations the SuperAgent proposed in its chat, for their cards there. */
+    public List<com.superagent.api.agent.AgentInviteDto> invites(String owner) {
+        Agent sa = agents.require(ensureState(owner).agentId(), owner);
+        Set<String> sessions = chats.listSessionsByAgent(sa.id()).stream().map(ChatSession::id).collect(Collectors.toSet());
+        return inviteService.proposedIn(owner, sessions);
+    }
+
+    /** Refuses the team-changing tools in a background round that works received messages. */
+    void requireOwnInput(McpGrants.Grant grant) {
+        if (Boolean.TRUE.equals(backgroundGrants.get(grant.token()))) {
             throw new IllegalArgumentException("处理外部消息时不能招人、调整成员、派任务或回复任务；需要团队去做的事请用 propose_plan 提计划。");
         }
     }
 
+    /**
+     * The background tells the user something in the chat: marked as coming from the background, and seen by the
+     * chat's next turn. Only background rounds may: the chat answers the user directly.
+     */
+    void tellUser(McpGrants.Grant grant, String text) {
+        if (!backgroundGrants.containsKey(grant.token())) {
+            throw new IllegalArgumentException("tell_user is for background rounds; in the chat, just answer the user");
+        }
+        if (text == null || text.isBlank()) {
+            throw new IllegalArgumentException("Nothing to tell");
+        }
+        Agent sa = agents.ensureSuperAgent(grant.owner());
+        chats.appendMessage(new ChatMessage(UUID.randomUUID().toString(), sessionId(sa), MessageRole.ASSISTANT,
+                text.strip(), Instant.now(), BACKGROUND_AUTHOR));
+        logSuper(grant.owner(), "info", "后台告知用户", text.strip());
+    }
+
+    /**
+     * What the background posted into the chat since the chat last answered, oldest first: the chat's own CLI
+     * conversation never saw these, so its next turn is told.
+     */
+    List<String> backgroundPostsSinceLastReply(String sessionId) {
+        List<ChatMessage> messages = chats.listMessages(sessionId);
+        List<String> posts = new ArrayList<>();
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessage m = messages.get(i);
+            if (m.role() != MessageRole.ASSISTANT) {
+                continue;
+            }
+            if (!BACKGROUND_AUTHOR.equals(m.author())) {
+                break;
+            }
+            posts.add(0, m.content());
+        }
+        return posts;
+    }
+
+    /** The background record: what reached the queue and how each round answered, newest last. */
+    public List<com.superagent.api.chat.MessageDto> background(String owner, int limit) {
+        SuperAgentState s = ensureState(owner);
+        List<ChatMessage> all = chats.listMessages(backgroundSession(agents.require(s.agentId(), owner)).id());
+        return all.subList(Math.max(0, all.size() - Math.max(1, limit)), all.size()).stream()
+                .map(m -> new com.superagent.api.chat.MessageDto(m.id(), m.role().name().toLowerCase(Locale.ROOT),
+                        m.content(), m.createdAt(), List.of(), null, null))
+                .toList();
+    }
+
     private void requireApproved(String owner) {
-        requireOwnInput(owner);
         SuperAgentState s = ensureState(owner);
         if (!SuperAgentState.PLAN_APPROVED.equals(s.planStatus())) {
             throw new IllegalArgumentException("计划尚未确认：请先用 propose_plan 提交计划，并请用户在界面上点击「确认执行」。"
@@ -747,18 +839,19 @@ public class SuperAgentService {
         });
     }
 
-    /** Where new inbox messages go: the SuperAgent's current session. */
+    /** The SuperAgent's current chat session. */
     private String sessionId(Agent sa) {
         return chatService.currentSessionId(sa.id());
     }
 
-    /** The inbox spans every session the SuperAgent has had, oldest first. */
-    private List<ChatMessage> agentMessages(String agentId) {
-        return chats.listSessionsByAgent(agentId).stream()
-                .filter(x -> x.status() != SessionStatus.DELETED)
-                .flatMap(x -> chats.listMessages(x.id()).stream())
-                .sorted(Comparator.comparing(ChatMessage::createdAt))
-                .toList();
+    /**
+     * The background's own session: its queue (system notes, received messages) and its rounds' replies, with a CLI
+     * conversation of its own. It belongs to no agent, so it never shows in the chat; its id follows from the
+     * SuperAgent's.
+     */
+    private ChatSession backgroundSession(Agent sa) {
+        String id = UUID.nameUUIDFromBytes(("superagent-background:" + sa.id()).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+        return chatService.ensureDetachedSession(id, "SuperAgent 后台");
     }
 
     private SuperAgentPlanDto plan(SuperAgentState s) {

@@ -30,7 +30,7 @@ import java.util.Map;
  * <p>Login is form-based but answers with JSON so the SPA can drive it; an
  * unauthenticated API call gets 401 while a page load is redirected to /login.
  * CSRF is disabled (token-less JSON API); the session cookie is {@code SameSite=Lax}
- * (set in application.properties) as the baseline mitigation.
+ * (set in application.yml) as the baseline mitigation.
  */
 @Configuration
 @EnableWebSecurity
@@ -48,10 +48,12 @@ public class SecurityConfig {
     SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
                 .csrf(csrf -> csrf.disable())
+                // The Files drawer shows a PDF in a frame of this same site; other sites still can't frame any page.
+                .headers(h -> h.frameOptions(f -> f.sameOrigin()))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/login", "/login.html", "/login.css", "/login.js", "/app.css", "/js/**",
                                 "/i18n.js", "/superagent-logo.png", "/favicon.ico").permitAll()
-                        .requestMatchers("/api/v1/meta", "/actuator/health").permitAll()
+                        .requestMatchers("/api/v1/meta", "/actuator/health", "/api/v1/branding/logo").permitAll()
                         .requestMatchers("/api/v1/auth/login", "/api/v1/auth/phone/**").permitAll()
                         .requestMatchers("/oauth2/**", "/login/oauth2/**", "/api/v1/auth/wechat/**").permitAll()
                         .requestMatchers("/mcp").permitAll() // gated by X-MCP-Token in McpController
@@ -60,10 +62,12 @@ public class SecurityConfig {
                         .requestMatchers("/api/v1/users/**").hasRole("ADMIN")
                         .requestMatchers("/api/v1/admin/**").hasRole("ADMIN")
                         .requestMatchers("/api/v1/providers/**").hasRole("ADMIN") // runs install commands on the host
-                        // Everyone may see which connectors exist and whether they're connected. Credentials are
-                        // shared by the whole platform, so adding, editing and (dis)connecting stay with admins.
+                        // Everyone sees the connectors and manages their own authorization (a personal token,
+                        // an OAuth handshake, a Feishu bind code); adding, editing and removing stay with admins.
                         .requestMatchers(HttpMethod.GET, "/api/v1/connectors").authenticated()
-                        .requestMatchers("/api/v1/connectors/**", "/api/v1/oauth/**").hasRole("ADMIN")
+                        .requestMatchers("/api/v1/connectors/*/token", "/api/v1/connectors/*/bind-code",
+                                "/api/v1/oauth/**").authenticated()
+                        .requestMatchers("/api/v1/connectors/**").hasRole("ADMIN")
                         // Everyone reads the defaults (e.g. to show an agent's effective model); only admins change them.
                         .requestMatchers(HttpMethod.GET, "/api/v1/settings").authenticated()
                         .requestMatchers("/api/v1/settings/**").hasRole("ADMIN")

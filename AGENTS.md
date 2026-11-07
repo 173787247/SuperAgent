@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository. The canonical, detaile
 
 ## What this is
 
-SuperAgent is the AI work system for companies, not a personal assistant: everyone in the company works in one system, and the work becomes company assets (see [README.md](README.md)). Design from the company's and its employees' side. It iterates fast; you will often be adding new functionality as well as changing existing behavior.
+SuperAgent is an AI collaborative work system for companies, not a personal assistant: everyone works with AI in one system, and the work becomes company assets (see [README.md](README.md)). Design from the company's and its employees' side. It iterates fast; you will often be adding new functionality as well as changing existing behavior.
 
 ## Build & test
 
@@ -15,7 +15,7 @@ mvn clean install                             # build + test all modules
 mvn clean install -DskipTests                 # build, skip tests
 mvn -pl superagent-task -am test              # one module (+ its deps)
 mvn -pl superagent-core test -Dtest=FooTest   # single test class
-mvn -pl superagent-server spring-boot:run     # run everything on :8080 (after mvn install)
+mvn -pl superagent-server spring-boot:run     # run everything on :18080 (after mvn install)
 ```
 
 ## Module architecture
@@ -24,7 +24,7 @@ Layered; depend only downward (full table and conventions in [CLAUDE.md](CLAUDE.
 
 - **L0** superagent-core (domain records, store interfaces, error bases), superagent-api (DTOs)
 - **L1** superagent-storage (JDBC), superagent-runtime (agent CLIs, MCP grants, attachments)
-- **L2** superagent-platform (users, settings, providers, connectors), superagent-knowledge (knowledge base, skills)
+- **L2** superagent-platform (users, settings, providers, connectors), superagent-skills (skills)
 - **L3** superagent-agent (chat, memory, collaboration), superagent-task (tasks, automations) — siblings, never depend on each other
 - **L4** superagent-orchestrator (SuperAgent), superagent-event (inbox)
 - **L5** superagent-web (controllers, MCP endpoint, auth), superagent-ui (static UI)

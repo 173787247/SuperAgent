@@ -30,9 +30,7 @@ const api = {
   listAgents: () => fetch("/api/v1/agents").then(r => r.json()),
   agentHistory: id => fetch("/api/v1/agents/" + id + "/history").then(r => r.json()),
   superState: () => fetch("/api/v1/superagent").then(r => r.json()),
-  superSubmit: body => fetch("/api/v1/superagent/messages", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  }).then(r => r.json()),
+  superBackground: () => fetch("/api/v1/superagent/background?limit=300").then(kbJson),
   superWork: (status, memberId, limit) => fetch("/api/v1/superagent/work?status=" + encodeURIComponent(status)
     + (memberId ? "&memberId=" + encodeURIComponent(memberId) : "") + "&limit=" + limit).then(r => r.json()),
   superWorkEvents: taskId => fetch("/api/v1/superagent/work/" + encodeURIComponent(taskId) + "/events")
@@ -99,6 +97,85 @@ const isUserRole = role => role === "user";
 // inline edit can recover the source. User text stays plain; agent text is markdown.
 function setBubbleContent(bubble, role, content) {
   bubble.dataset.md = content == null ? "" : String(content);
-  if (isUserRole(role)) bubble.textContent = content;
-  else bubble.innerHTML = renderMarkdown(content);
+  if (isUserRole(role)) { bubble.textContent = content; return; }
+  // A failed turn keeps its error after the reply (ChatService.ERROR_MARK): show it as an error, not as Markdown.
+  const raw = content == null ? "" : String(content);
+  const at = raw.indexOf(REPLY_ERROR_MARK);
+  if (at < 0) { bubble.innerHTML = renderMarkdown(raw); return; }
+  bubble.innerHTML = at > 0 ? renderMarkdown(raw.slice(0, at)) : "";
+  const err = document.createElement("div");
+  err.className = "bubble__error";
+  err.textContent = L("chat.errored", { msg: raw.slice(at + REPLY_ERROR_MARK.length).trim() || L("chat.errGeneric") });
+  bubble.appendChild(err);
 }
+const REPLY_ERROR_MARK = "⚠️ 出错了：";
+
+// ---------- shared request helpers and the small dialog ----------
+// Server errors come back as {code, message}; surface the message.
+async function kbJson(r) {
+  const body = await r.json().catch(() => null);
+  if (!r.ok) throw new Error((body && body.message) || ("HTTP " + r.status));
+  return body ? body.data : null;
+}
+function kbPost(url, body) {
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then(kbJson);
+}
+function kbFormatSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+// One small dialog for a name, a confirmation or a choice; action() does the request and may throw.
+const kel = {
+  modal: document.getElementById("kbModal"),
+  form: document.getElementById("kbForm"),
+  modalTitle: document.getElementById("kbModalTitle"),
+  modalMsg: document.getElementById("kbModalMsg"),
+  nameField: document.getElementById("kbNameField"),
+  nameInput: document.getElementById("kbNameInput"),
+  targetField: document.getElementById("kbTargetField"),
+  targetSelect: document.getElementById("kbTargetSelect"),
+  modalError: document.getElementById("kbModalError"),
+  modalSubmit: document.getElementById("kbModalSubmit"),
+};
+let kbModalAction = null;
+
+function kbOpenModal({ title, submit, danger, message, name, nameLabel, targets, action }) {
+  kbModalAction = action;
+  kel.modalTitle.textContent = title;
+  kel.modalSubmit.textContent = submit;
+  kel.modalSubmit.classList.toggle("btn--danger", !!danger);
+  kel.modalMsg.hidden = !message;
+  kel.modalMsg.textContent = message || "";
+  kel.nameField.hidden = name === undefined;
+  kel.nameField.querySelector("span").textContent = nameLabel || L("common.name");
+  kel.nameInput.value = name || "";
+  kel.targetField.hidden = !targets;
+  kel.targetSelect.innerHTML = "";
+  (targets || []).forEach(t => {
+    const o = document.createElement("option");
+    o.value = t;
+    o.textContent = t;
+    kel.targetSelect.appendChild(o);
+  });
+  kel.modalError.hidden = true;
+  kel.modal.hidden = false;
+  if (name !== undefined) { kel.nameInput.focus(); kel.nameInput.select(); }
+}
+const kbCloseModal = () => { kel.modal.hidden = true; kbModalAction = null; };
+kel.modal.querySelectorAll("[data-close]").forEach(x => x.addEventListener("click", kbCloseModal));
+kel.form.addEventListener("submit", async e => {
+  e.preventDefault();
+  if (!kbModalAction) return;
+  kel.modalSubmit.disabled = true;
+  try {
+    await kbModalAction();
+    kbCloseModal();
+  } catch (err) {
+    kel.modalError.textContent = err.message;
+    kel.modalError.hidden = false;
+  } finally {
+    kel.modalSubmit.disabled = false;
+  }
+});

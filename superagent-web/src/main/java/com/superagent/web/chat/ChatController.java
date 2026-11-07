@@ -42,13 +42,14 @@ public class ChatController {
     }
 
     @PostMapping(ApiPaths.SESSIONS)
-    public ApiResponse<SessionDto> createSession(@RequestBody(required = false) CreateSessionRequest request) {
-        return ApiResponse.ok(chatService.createSession(request));
+    public ApiResponse<SessionDto> createSession(@RequestBody(required = false) CreateSessionRequest request,
+                                                 Authentication auth) {
+        return ApiResponse.ok(chatService.createSessionFor(request, auth.getName()));
     }
 
     @GetMapping(ApiPaths.SESSIONS)
-    public ApiResponse<List<SessionDto>> listSessions() {
-        return ApiResponse.ok(chatService.listSessions());
+    public ApiResponse<List<SessionDto>> listSessions(Authentication auth) {
+        return ApiResponse.ok(chatService.listSessions(auth.getName()));
     }
 
     @GetMapping(ApiPaths.SESSIONS + "/{id}")
@@ -75,7 +76,8 @@ public class ChatController {
     public SseEmitter sendMessage(@PathVariable String id, @RequestBody SendMessageRequest request,
                                   Authentication auth) {
         chatService.requireAccess(id, auth.getName());
-        return chatService.sendMessage(id, request.content(), request.images(), auth == null ? null : auth.getName());
+        return chatService.sendMessage(id, request.content(), request.images(), request.fileIds(),
+                auth == null ? null : auth.getName());
     }
 
     @GetMapping(ApiPaths.SESSIONS + "/{id}/messages/{messageId}/images/{index}")
@@ -90,6 +92,13 @@ public class ChatController {
     public ApiResponse<LiveTurnDto> live(@PathVariable String id, Authentication auth) {
         chatService.requireAccess(id, auth.getName());
         return ApiResponse.ok(chatService.live(id));
+    }
+
+    /** The running turn as it happens, for every viewer: the same events the sender's stream carries, replayed from the start. */
+    @GetMapping(value = ApiPaths.SESSIONS + "/{id}/live/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter watchLive(@PathVariable String id, Authentication auth) {
+        chatService.requireAccess(id, auth.getName());
+        return chatService.watchLive(id);
     }
 
     @PostMapping(ApiPaths.SESSIONS + "/{id}/stop")

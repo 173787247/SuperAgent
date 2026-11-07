@@ -19,7 +19,12 @@
   <dependencies>
     <dependency>
       <groupId>com.superagent</groupId>
-      <artifactId>superagent-knowledge</artifactId>
+      <artifactId>superagent-skills</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.superagent</groupId>
+      <artifactId>superagent-files</artifactId>
     </dependency>
 
     <dependency>

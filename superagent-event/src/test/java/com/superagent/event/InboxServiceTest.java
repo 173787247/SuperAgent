@@ -59,7 +59,6 @@ class InboxServiceTest {
         @Override public List<String> teams(String u) { return List.of(); }
         @Override public Map<String, List<String>> memberships() { return Map.of(); }
         @Override public void setTeams(String u, List<String> t) { }
-        @Override public void renameTeam(String from, String to) { }
     }
 
     private static final class Users implements UserStore {
@@ -86,8 +85,8 @@ class InboxServiceTest {
 
     private static EventSource source() {
         Instant now = Instant.now();
-        return new EventSource("ada", EventSource.FEISHU, "cli", "v1:x", true, "ou_ada", null,
-                "09:00", "Asia/Shanghai", null, null, null, null, null, now, now);
+        return new EventSource("ada", EventSource.FEISHU, "cli", true, "ou_ada", null,
+                "09:00", "Asia/Shanghai", null, null, null, now, now);
     }
 
     private static InboxEvent msg(String id, String chatType, boolean mentionsMe, String sender, String text) {

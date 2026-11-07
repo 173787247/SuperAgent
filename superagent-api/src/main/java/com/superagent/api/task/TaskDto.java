@@ -33,5 +33,9 @@ public record TaskDto(
          * in_use (held by another task) | released (not loaded, e.g. after a restart — resumed on demand).
          * Null before the task starts.
          */
-        String sessionState) {
+        String sessionState,
+        /** The tier it ran at, when tiers are on; {@code model} is the model that tier meant. */
+        String tier,
+        /** The chat reply that set it off, in an agent's list of its tasks; null elsewhere. */
+        String originMessageId) {
 }

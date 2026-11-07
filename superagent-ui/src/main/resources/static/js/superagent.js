@@ -2,9 +2,12 @@
 // Classic script sharing one global scope with the others; index.html loads them in order.
 "use strict";
 
-// ---------- SuperAgent inbox mode ----------
-// The SuperAgent doesn't answer live: messages are dropped into its inbox and worked through in
-// rounds once input goes quiet. The view polls its state and conversation while it is open.
+// ---------- SuperAgent chat ----------
+// The SuperAgent chats live like any agent (sendMessage / the live view). Its background works through task
+// results and received messages on its own and posts what the user needs to know into this conversation, so
+// while the chat is open the view polls for those posts, the plan card and the background's state — never while
+// a reply is streaming in.
+const BACKGROUND_AUTHOR = "superagent:background";
 let superMode = false;
 let superTimer = null;
 let superFingerprint = null;
@@ -15,79 +18,204 @@ function setSuperMode(on) {
   clearInterval(superTimer);
   // Only while the conversation is actually on screen (tab visible, chat view shown).
   superTimer = on ? setInterval(() => {
-    if (!document.hidden && el.messages.offsetParent !== null) refreshSuper();
+    if (!document.hidden && el.messages.offsetParent !== null) refreshSuper(false);
   }, 3000) : null;
   el.input.setAttribute("placeholder", on ? L("super.placeholder") : composerPlaceholder);
-  el.composer.classList.toggle("composer--inbox", on);
   document.getElementById("superWorkPanel").hidden = !on;
   if (on) loadSuperRecent();
   el.messages.classList.toggle("messages--super", on);
 }
 
-async function submitToSuper(text, images) {
-  el.sendBtn.disabled = true;
-  const res = await api.superSubmit({ content: text, images }).catch(() => null);
-  el.sendBtn.disabled = false;
-  if (!res || !res.data) { showToast((res && res.message) || L("super.sendFailed"), true); return; }
-  el.input.value = ""; // only now, so a failed send keeps the text
-  autoGrow();
-  chatImages.clear();
-  superFingerprint = null;
-  await refreshSuper();
-}
-
-async function refreshSuper() {
+/** {@code force}: re-render even if nothing changed (opening the chat, a turn just ended). */
+async function refreshSuper(force) {
   if (!superMode || !activeSessionId) return;
+  if (!force && (streaming || liveWatch)) return; // a reply is coming in: leave it alone
   const agentId = activeAgentId;
   const [stateRes, historyRes] = await Promise.all([
     api.superState().catch(() => null), api.agentHistory(agentId).catch(() => null)]);
-  if (!superMode || activeAgentId !== agentId) return; // switched away meanwhile
+  if (!superMode || activeAgentId !== agentId || (!force && (streaming || liveWatch))) return;
   const state = stateRes && stateRes.data;
   const items = flattenHistory((historyRes && historyRes.data) || []);
-  const messages = items;
   if (!state) return;
   if (state.sessionId) activeSessionId = state.sessionId;
+  renderBackgroundState(state);
   // Re-render only on change, so polling doesn't reset scroll or flicker.
-  const last = messages[messages.length - 1];
-  const fp = [messages.length, last && last.id, state.processedUntil, state.running, state.roundCutoff,
-    state.plan && state.plan.id, state.plan && state.plan.status].join("|");
-  if (fp === superFingerprint) return;
+  const last = items[items.length - 1];
+  const fp = [items.length, last && last.id, state.plan && state.plan.id, state.plan && state.plan.status].join("|");
+  if (!force && fp === superFingerprint) return;
   superFingerprint = fp;
-  loadSuperRecent(); // a finished task always lands a report in the inbox, which changes the fingerprint
+  loadSuperRecent();
   const nearBottom = el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight < 80;
   el.messages.innerHTML = "";
-  if (!messages.length) {
+  if (!items.length) {
     el.messages.innerHTML = '<div class="empty-state"><p>' + escapeHtml(L("super.welcome")) + "</p></div>";
   }
-  const processed = state.processedUntil ? new Date(state.processedUntil) : null;
-  const cutoff = state.roundCutoff ? new Date(state.roundCutoff) : null;
-  // The plan sits in the conversation where it was made: right under the reply of the round that
-  // proposed it. That reply is written when the round ends, so until then the card waits at the end.
+  // The plan sits in the conversation where it was made: right under the first reply after it was proposed
+  // (until that reply exists, at the end).
   const planAt = state.plan && state.plan.proposedAt ? new Date(state.plan.proposedAt) : null;
   let planShown = !state.plan;
   items.forEach(m => {
     const msgEl = renderHistoryItem(m);
+    if (m.role === "assistant" && m.author === BACKGROUND_AUTHOR) markBackground(msgEl);
     if (!planShown && planAt && m.role === "assistant" && new Date(m.createdAt) >= planAt) {
       el.messages.appendChild(planCard(state.plan));
       planShown = true;
     }
-    if (m.role !== "user") return;
-    const at = new Date(m.createdAt);
-    if (processed && at <= processed) return; // handled in an earlier round
-    const chip = document.createElement("span");
-    const thinking = state.running && cutoff && at <= cutoff;
-    chip.className = "msg__status" + (thinking ? " is-thinking" : "");
-    chip.textContent = L(thinking ? "super.thinking" : "super.received");
-    msgEl.appendChild(chip);
   });
   if (!planShown) el.messages.appendChild(planCard(state.plan));
-  if (state.running) {
-    const working = document.createElement("div");
-    working.className = "super-working";
-    working.textContent = L("super.working");
-    el.messages.appendChild(working);
+  if (activeAgent) attachFileCards(activeAgent);
+  attachSuperInviteCards();
+  attachSkillDeletionCards(activeAgentId);
+  attachDispatchCards();
+  if (force || nearBottom || !last || last.role !== "assistant") scrollToBottom();
+}
+
+/**
+ * Invitations the SuperAgent proposed for the user's other agents: the same confirm card as in an agent's own chat,
+ * under the reply that proposed it, acting on the agent it's for.
+ */
+async function attachSuperInviteCards() {
+  const agentId = activeAgentId;
+  const list = (await fetch("/api/v1/superagent/invites").then(kbJson).catch(() => null)) || [];
+  if (!superMode || activeAgentId !== agentId) return;
+  list.forEach(inv => {
+    const msg = inv.messageId && el.messages.querySelector('.msg[data-mid="' + CSS.escape(inv.messageId) + '"]');
+    if (!msg) return;
+    const card = inviteCard({ id: inv.agentId, name: inv.agentName }, inv); // the user owns it: they confirm
+    const old = msg.querySelector('.invite-card[data-iid="' + CSS.escape(inv.id) + '"]');
+    if (old) old.replaceWith(card); else (msg.querySelector(".bubble") || msg).appendChild(card);
+  });
+}
+
+// ---------- the background ----------
+const bgel = {
+  state: document.getElementById("superBgState"),
+  drawer: document.getElementById("superBgDrawer"),
+  list: document.getElementById("superBgList"),
+  empty: document.getElementById("superBgEmpty"),
+};
+
+function renderBackgroundState(state) {
+  bgel.state.textContent = state.running ? L("super.bgRunning") : L("super.bgIdle");
+  bgel.state.classList.toggle("is-running", !!state.running);
+}
+
+/**
+ * The record reads as rounds: the inputs that reached the queue (task results, received messages), then how the
+ * round handled them. Inputs that haven't been worked yet come last, marked as waiting.
+ */
+async function openBackgroundRecord() {
+  bgel.drawer.hidden = false;
+  bgel.list.replaceChildren();
+  const items = (await api.superBackground().catch(() => null)) || [];
+  const rounds = [];
+  let inputs = [];
+  items.forEach(m => {
+    if (m.role === "assistant") { rounds.push({ inputs, reply: m }); inputs = []; } else inputs.push(m);
+  });
+  if (inputs.length) rounds.push({ inputs, reply: null });
+  bgel.empty.hidden = rounds.length > 0;
+  rounds.reverse().forEach(r => bgel.list.appendChild(backgroundRound(r)));
+}
+
+function backgroundRound(r) {
+  const li = document.createElement("li");
+  li.className = "bg-round";
+  const head = document.createElement("div");
+  head.className = "bg-round__head";
+  const when = document.createElement("time");
+  when.textContent = formatDateTime((r.reply || r.inputs[r.inputs.length - 1]).createdAt);
+  const what = document.createElement("span");
+  what.textContent = r.reply ? L("super.bgRound", { n: r.inputs.length }) : L("super.bgWaiting", { n: r.inputs.length });
+  head.append(when, what);
+  const ins = document.createElement("details");
+  ins.className = "bg-round__inputs";
+  const sum = document.createElement("summary");
+  sum.textContent = L("super.bgInputs", { n: r.inputs.length });
+  ins.appendChild(sum);
+  r.inputs.forEach(m => {
+    const p = document.createElement("pre");
+    p.textContent = m.content;
+    ins.appendChild(p);
+  });
+  li.append(head, ins);
+  if (r.reply) {
+    const reply = document.createElement("div");
+    reply.className = "bg-round__reply md";
+    reply.innerHTML = renderMarkdown(r.reply.content || "");
+    li.appendChild(reply);
   }
-  if (nearBottom || !last || last.role !== "assistant") scrollToBottom();
+  return li;
+}
+
+document.getElementById("superBgBtn").addEventListener("click", openBackgroundRecord);
+bgel.drawer.querySelectorAll("[data-close]").forEach(x => x.addEventListener("click", () => { bgel.drawer.hidden = true; }));
+
+// ---------- what each reply handed out ----------
+// Under a SuperAgent reply that started or assigned tasks: each task's name (opens it), who's on it (opens their
+// chat; an independent task has nobody to open) and how it stands. Work from the background has no reply: no card.
+async function attachDispatchCards() {
+  const agentId = activeAgentId;
+  const res = await api.superWork("all", null, 200).catch(() => null);
+  if (!superMode || activeAgentId !== agentId) return;
+  const byReply = new Map();
+  ((res && res.data) || []).filter(w => w.messageId).forEach(w => {
+    if (!byReply.has(w.messageId)) byReply.set(w.messageId, []);
+    byReply.get(w.messageId).unshift(w); // oldest first, in the order they were handed out
+  });
+  byReply.forEach((items, messageId) => {
+    const msg = el.messages.querySelector('.msg[data-mid="' + CSS.escape(messageId) + '"]');
+    if (!msg) return;
+    const old = msg.querySelector(".sa-dispatch");
+    const card = dispatchCard(items);
+    if (old) old.replaceWith(card); else (msg.querySelector(".bubble") || msg).appendChild(card);
+  });
+}
+
+/** {@code items}: what one reply set off, oldest first; an item marked {@code self} is the agent's own task (no "→ who"). */
+function dispatchCard(items) {
+  const box = document.createElement("div");
+  box.className = "sa-dispatch";
+  items.forEach(w => {
+    const row = document.createElement("div");
+    row.className = "sa-dispatch__row";
+    const task = document.createElement("button");
+    task.type = "button";
+    task.className = "sa-dispatch__task";
+    task.title = L("super.dispatchOpenTask");
+    task.textContent = w.title;
+    task.addEventListener("click", () => openTaskFromWork(w.taskId));
+    if (w.self) { row.append(workBadge(w.status), task); box.appendChild(row); return; } // the agent does it itself
+    const arrow = document.createElement("span");
+    arrow.className = "sa-dispatch__arrow";
+    arrow.textContent = "→";
+    let who;
+    const member = w.byMember && agents.find(a => a.id === w.memberId);
+    if (member) {
+      who = document.createElement("button");
+      who.type = "button";
+      who.className = "sa-dispatch__who";
+      who.title = L("super.dispatchOpenAgent");
+      who.textContent = (member.avatar ? member.avatar + " " : "") + member.name;
+      who.addEventListener("click", () => selectAgent(member));
+    } else {
+      who = document.createElement("span");
+      who.className = "sa-dispatch__who is-plain";
+      who.textContent = w.byMember ? (w.memberName || "—") : L("super.dispatchIndependent");
+    }
+    row.append(workBadge(w.status), task, arrow, who);
+    box.appendChild(row);
+  });
+  return box;
+}
+
+/** What the background posted into the chat: labelled, so it doesn't read as an answer to the last message. */
+function markBackground(msgEl) {
+  msgEl.classList.add("msg--background");
+  const tag = document.createElement("div");
+  tag.className = "msg__bg-tag";
+  tag.textContent = L("super.bgTag");
+  msgEl.prepend(tag);
 }
 
 function planCard(plan) {
@@ -143,7 +271,9 @@ function planCard(plan) {
         return;
       }
       superFingerprint = null;
-      refreshSuper();
+      if (streaming || liveWatch) { refreshSuper(true); return; }
+      // Approval carries on in the chat: the SuperAgent builds the team and assigns the work, live.
+      sendMessage(L("super.approvedMsg", { id: plan.id }), [], [], [], []);
     });
     foot.append(hint, btn);
     card.appendChild(foot);
@@ -169,7 +299,8 @@ const wel = {
 };
 
 async function loadSuperRecent() {
-  const res = await api.superWork("finished", null, 10).catch(() => null);
+  // Everything it set off, newest first: running and failed work is what most needs seeing.
+  const res = await api.superWork("all", null, 10).catch(() => null);
   const items = (res && res.data) || [];
   wel.recent.replaceChildren(...items.map(recentRow));
   wel.recentEmpty.hidden = items.length > 0;
@@ -181,7 +312,8 @@ function recentRow(w) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "sw-row";
-  btn.title = (TASK_STATUS_LABEL[w.status] || L("status." + w.status)) + " · " + formatDateTime(w.finishedAt);
+  const label = TASK_STATUS_LABEL[w.status] || L("status." + w.status);
+  btn.title = label + " · " + formatDateTime(w.finishedAt || w.assignedAt);
   const dot = document.createElement("span");
   dot.className = "sw-dot is-" + w.status;
   const body = document.createElement("span");
@@ -196,7 +328,10 @@ function recentRow(w) {
   who.textContent = (w.memberAvatar ? w.memberAvatar + " " : "") + (w.memberName || "—");
   const when = document.createElement("span");
   when.className = "sw-when";
-  when.textContent = w.finishedAt ? relativeTime(w.finishedAt) : "";
+  // Still going (or waiting on a decision): say so, since the dot alone is easy to miss.
+  const open = !w.finishedAt;
+  when.textContent = open ? label : relativeTime(w.finishedAt);
+  if (open) when.classList.add("sw-when--" + w.status);
   meta.append(who, when);
   body.append(title, meta);
   btn.append(dot, body);

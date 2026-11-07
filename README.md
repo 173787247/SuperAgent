@@ -3,7 +3,7 @@
   <img src="docs/images/superagent-logo.png" alt="SuperAgent logo" style="max-width: 50%;" />
 </p>
 
-**The AI work system for companies, not personal assistants.** Everyone in the company works in one system, and the work becomes the company's assets. Open source and self-hosted.
+**AI collaborative work system for companies, not personal assistants.** Everyone works with AI in one system, and the work becomes the company's assets. Open source and self-hosted.
 
 [Website](https://oryx-labs.github.io/SuperAgent/) · [Live demo](http://117.72.92.117:18081/login) · [中文](https://oryx-labs.github.io/SuperAgent/zh/)
 
@@ -23,7 +23,7 @@ SuperAgent is designed from the company's side instead: the company and its empl
 
 ## Why SuperAgent?
 
-Handing every employee a personal assistant doesn't make AI work for a company. The work leaves with the person, colleagues can't build on each other, knowledge never accumulates, costs are scattered and wasteful, and the company can't see any of it.
+Handing every employee a personal assistant doesn't make AI work for a company. The work leaves with the person, colleagues can't build on each other, nothing accumulates, costs are scattered and wasteful, and the company can't see any of it.
 
 **In short, SuperAgent is company-controlled, cost-efficient, accumulates assets automatically, and is easy to use.**
 
@@ -31,9 +31,9 @@ Handing every employee a personal assistant doesn't make AI work for a company. 
 
 In priority order. Items marked *(coming soon)* are still being built.
 
-1. **Work becomes company assets.** Everyone works in one system, so conversations, tasks, and deliverables stay with the company. Agents distill what they learn into memory, and the system summarizes and consolidates work into company knowledge *(company-wide consolidation: coming soon)*.
+1. **Work becomes company assets.** Everyone works in one system. Everything agents produce, and everything people send them (files and links), is kept in Files, and each agent builds its own long-term memory. When people change, the agent stays with its memory and files.
 2. **Collaboration and handoff.** Collaboration happens inside one AI system: several people can work with the same agent on the same job. When someone leaves, their agents and context go to the next person, who continues from there *(handoff: coming soon)*.
-3. **Assets for each person, team, and the company.** Skills and knowledge bases at the employee, team, and company levels hold what everyday work needs, so a new hire starts with what the team already knows.
+3. **Reusable methods.** Skills at the personal and company levels turn good practice into company practice. Agents are team assets too: their setup, memory, and files belong to the company, so a new hire takes over instead of starting from zero.
 4. **Cost and models.** Employees get AI on day one, with no personal subscriptions and no wasted tokens. The company pays by usage, sees spend per task and per model, works with any model provider, and routes each task to a model that fits its difficulty *(routing by difficulty: coming soon)*.
 5. **Audit and security.** Built-in audit and security: human confirmation for key decisions, identity and permissions, per-agent run logs, and office tools such as Feishu, with enterprise approvals connected *(approvals: coming soon)*.
 
@@ -42,8 +42,23 @@ Also included: a SuperAgent for every employee (inbox, plan-then-execute, team a
 ## Architecture
 
 <p align="center">
-  <img src="docs/images/superagent-architecture.jpg" alt="SuperAgent architecture" width="100%" />
+  <img src="docs/images/superagent-architecture.svg" alt="SuperAgent architecture" width="100%" />
 </p>
+
+## Install
+
+Every release on the [Releases page](https://github.com/oryx-labs/SuperAgent/releases) has a tarball (`superagent-<version>.tar.gz`, with its `.sha256`) and a Docker image.
+
+**Docker** (the image has Java 21, Node.js 24 and the agent CLIs preinstalled: Claude Code, Codex, Gemini CLI, Qwen Code, Kimi Code and DeepSeek Harness):
+
+```bash
+cp docker/.env.example docker/.env      # set the admin and MySQL passwords
+docker compose -f docker/docker-compose.yml --env-file docker/.env up -d
+```
+
+This starts SuperAgent with MySQL on `http://<host>:18080`. The image is `ghcr.io/oryx-labs/superagent:<version>` (or `:latest`). `ghcr.io/oryx-labs/superagent-base` is the same image without SuperAgent, if you only want the CLIs. If the host can't reach the model APIs directly, set `HTTPS_PROXY` in `docker/.env`.
+
+**Tarball:** download it from the release, then follow [Configure](#configure) and [Start and stop](#start-and-stop) below.
 
 ## Build and run
 
@@ -66,7 +81,7 @@ This produces `superagent-server/target/superagent-<version>.tar.gz`, which unpa
 ```text
 superagent-<version>/
 ├── bin/      superagent-start.sh, superagent-stop.sh
-├── config/   application.properties, superagent.env
+├── config/   application.yml, superagent.env
 ├── libs/     superagent.jar
 ├── logs/     superagent.log, console.out, superagent.pid
 └── data/     agent and task workspaces
@@ -74,8 +89,8 @@ superagent-<version>/
 
 ### Configure
 
-- `config/superagent.env`: secrets and deployment values, sourced by the start script. It includes the admin password, MySQL connection, GitHub OAuth, `SERVER_PORT` and `JAVA_OPTS`. Every entry ships commented out. Keep the file at mode `600`.
-- `config/application.properties`: overrides the defaults built into the jar. Changes take effect on restart, with no repackaging.
+- `config/superagent.env`: secrets and deployment values, sourced by the start script. It includes the admin password, MySQL connection, `SERVER_PORT` and `JAVA_OPTS`. Outside systems (the GitHub OAuth app, the Feishu app) are set up by an administrator under **Admin → System Settings → Integrations**, not in this file. Every entry ships commented out. Keep the file at mode `600`.
+- `config/application.yml`: overrides the defaults built into the jar. Changes take effect on restart, with no repackaging.
 
 At minimum, set these before the first start:
 
@@ -101,14 +116,26 @@ bin/superagent-stop.sh           # stop
 - **force:** stops the running process with SIGTERM. The server shuts down gracefully; if it is still running after 35 seconds (`STOP_TIMEOUT`), it is killed. The server then starts again.
 - **Working directory:** the scripts can be run from any directory. Relative paths in the config, such as `./data`, resolve against the install directory.
 
-Once started, open `http://<host>:8080` and sign in as the admin user.
+Once started, open `http://<host>:18080` and sign in as the admin user.
 
 ### Development
 
 ```bash
 mvn clean install                                  # build and test all modules
-mvn -pl superagent-server spring-boot:run          # run locally on :8080
+mvn -pl superagent-server spring-boot:run          # run locally on :18080
 ```
+
+Under `spring-boot:run`, the UI is served straight from `superagent-ui/src/main/resources/static`, so front-end edits show up on a browser refresh with no rebuild or restart. Back-end (Java) changes still need `mvn install` and a restart.
+
+### Releasing
+
+A pull request to `main` whose title starts with `release:` is a release. The version is the one in the pom, so bump it in that pull request:
+
+```bash
+mvn versions:set -DnewVersion=0.2.0 -DgenerateBackupPoms=false   # every module's pom
+```
+
+While the pull request is open, [the release workflow](.github/workflows/release.yml) builds, tests, packages and builds the image without publishing anything. When it's merged, the workflow tags `v<version>`, publishes the GitHub Release with the tarball and its checksum, and pushes the images to `ghcr.io` for `linux/amd64` and `linux/arm64`. A version that's already released fails the check, and release pull requests must come from a branch in this repository. Versions ending in `-alpha`, `-beta` or `-rc` are published as pre-releases, without moving `latest`.
 
 ## Status
 

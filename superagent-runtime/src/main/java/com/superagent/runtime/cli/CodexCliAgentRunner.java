@@ -12,6 +12,7 @@ import com.superagent.core.chat.Cancellation;
 import com.superagent.core.chat.ImageAttachment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -44,7 +45,7 @@ import java.util.regex.Pattern;
  * <p>The prompt goes in on stdin ({@code -}): no argv flag injection, and stdin is closed so
  * Codex doesn't sit waiting for more input. Permissions map from the Claude-style settings:
  * skip-permissions → bypass sandbox; an allowlist with a write-capable tool → workspace-write;
- * otherwise read-only. Codex reports token usage but no dollar cost, so no USAGE is emitted.
+ * otherwise read-only. Codex reports token usage (TOKENS) but no dollar cost, so no USAGE is emitted.
  */
 @Component
 public class CodexCliAgentRunner implements AgentRunner {
@@ -61,6 +62,13 @@ public class CodexCliAgentRunner implements AgentRunner {
 
     private final String command;
     private final long timeoutSeconds;
+    private CliPaths cliPaths; // null in tests: the command runs from the process PATH as given
+
+    /** Run the CLI from the shared search path, so one the Models page installed (e.g. on a private Node) is found. */
+    @Autowired(required = false)
+    void setCliPaths(CliPaths cliPaths) {
+        this.cliPaths = cliPaths;
+    }
 
     public CodexCliAgentRunner(
             @Value("${superagent.agent.codex.command:codex}") String command,
@@ -88,6 +96,13 @@ public class CodexCliAgentRunner implements AgentRunner {
         Process process;
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd).directory(new File(request.workspaceDir()));
+            if (cliPaths != null) {
+                cliPaths.apply(pb);
+            }
+            if (request.credential() != null) {
+                // Codex's documented per-run key for exec mode; it never appears in argv.
+                pb.environment().put("CODEX_API_KEY", request.credential().apiKey());
+            }
             // MCP bearer tokens go through the environment, never argv (visible in ps / logs).
             for (McpServer server : mcpServers(request)) {
                 if (server.token() != null) {
@@ -140,6 +155,8 @@ public class CodexCliAgentRunner implements AgentRunner {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
             emit(sink, request, seq, AgentEventType.ERROR, "Codex run interrupted");
+        } finally {
+            Tokens.emit(sink, request.sessionId(), seq + 1, parser.tokens(request.model()));
         }
     }
 
@@ -155,6 +172,17 @@ public class CodexCliAgentRunner implements AgentRunner {
             cmd.add("-s");
             boolean canWrite = request.allowedTools() != null && request.allowedTools().stream().anyMatch(WRITE_TOOLS::contains);
             cmd.add(canWrite ? "workspace-write" : "read-only");
+        }
+        if (request.credential() != null) {
+            // The machine's config.toml may select a provider of its own (a relay): that would ignore the base URL
+            // below and this run's key. Back to the built-in one, whose endpoint is the entry's.
+            cmd.add("-c");
+            cmd.add("model_provider=\"openai\"");
+        }
+        if (request.credential() != null && request.credential().baseUrl() != null) {
+            // Points the built-in OpenAI provider at the entry's endpoint, per run (not written to config.toml).
+            cmd.add("-c");
+            cmd.add("openai_base_url=" + jsonString(request.credential().baseUrl()));
         }
         for (McpServer server : mcpServers(request)) {
             // Values are TOML; a JSON-quoted string is a valid TOML basic string.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-SuperAgent is the AI work system for companies, not a personal assistant: everyone in the company works in one system, and the work becomes company assets (see [README.md](README.md) for the positioning, in priority order). Design features from the company's and its employees' side, not one person's. The core is running and iterating fast; you will often be scaffolding new functionality as well as modifying existing behavior.
+SuperAgent is an AI collaborative work system for companies, not a personal assistant: everyone works with AI in one system, and the work becomes company assets (see [README.md](README.md) for the positioning, in priority order). Design features from the company's and its employees' side, not one person's. The core is running and iterating fast; you will often be scaffolding new functionality as well as modifying existing behavior.
 
 ## Build & test
 
@@ -24,35 +24,40 @@ mvn -pl superagent-core test -Dtest=SomeClassTest#method # single test method
 Run the application (superagent-server is the one executable Spring Boot jar):
 
 ```bash
-mvn install -DskipTests && mvn -pl superagent-server spring-boot:run   # everything on :8080
+mvn install -DskipTests && mvn -pl superagent-server spring-boot:run   # everything on :18080
 mvn clean package -PreleaseTgz                                         # release tarball (see README)
 ```
 
-Smoke-check web wiring: `curl localhost:8080/api/v1/meta`.
+Smoke-check web wiring: `curl localhost:18080/api/v1/meta`.
+
+Under `spring-boot:run` the UI is served straight from `superagent-ui/src/main/resources/static` (configured in
+superagent-server's pom), so front-end edits show on a browser refresh. Java changes still need `mvn install` + restart.
 
 ## Module architecture
 
-Thirteen Maven modules, layered; a module may only depend on modules below it (Maven enforces this — a
+Fifteen Maven modules, layered; a module may only depend on modules below it (Maven enforces this — a
 module only sees what its pom declares):
 
 ```text
-L6  superagent-server        boots everything (the only executable jar); application.properties lives here
+L6  superagent-server        boots everything (the only executable jar); application.yml lives here
 L5  superagent-web           HTTP only: REST controllers, the MCP endpoint, auth/security, GlobalExceptionHandler
 L5  superagent-ui            the browser UI: static HTML/CSS/JS served from classpath:/static
 L4  superagent-orchestrator  the user's SuperAgent: plans work, hires team members, assigns tasks
-L4  superagent-event         the inbox: Feishu bot connector, triage + batch schedule, secretary, to-dos
+L4  superagent-event         the inbox: the company Feishu app (routing to employees), triage + batch schedule, to-dos
+L3  superagent-cost         cost optimisation: model tiers worked out from prices and what can run (a core ModelRouter)
 L3  superagent-agent         conversations: agents, chat turns, memory, characters, collaboration, run log
 L3  superagent-task          execution: tasks, session pool, watchdog, the coding flow, automations
-L2  superagent-knowledge     organizational knowledge: the file knowledge base and shared skills
-L2  superagent-platform      administration: users, system settings, model providers, connectors
-L1  superagent-runtime       driving the coding-agent CLIs (Claude Code, Codex), per-turn MCP grants, image attachments
+L2  superagent-skills        skills: the working standards agents follow (personal or company-wide)
+L2  superagent-files         work files: what agents produce (documents, images, videos), their storage (local disk, S3-compatible) and agent tools
+L2  superagent-platform      administration: users, system settings, model providers, connectors (and the MCP servers runs get)
+L1  superagent-runtime       driving the coding-agent CLIs (Claude Code, Codex, DeepSeek, Kimi, Qwen; GLM via Claude Code), per-turn MCP grants, image attachments
 L1  superagent-storage       JDBC implementations of the core store interfaces (MySQL, ClickHouse)
 L0  superagent-api           request/response DTOs and API paths
 L0  superagent-core          domain records, store interfaces, error base types, small shared utilities
 ```
 
-- **agent and task are siblings** and never depend on each other; what both need (skills, the knowledge
-  base) sits below them in knowledge. Anything that needs both (SuperAgent, the inbox secretary) is above.
+- **agent and task are siblings** and never depend on each other; what both need (skills, files) sits
+  below them in skills and files. Anything that needs both (SuperAgent, the inbox secretary) is above.
 - **Packages follow modules**: `com.superagent.<module>[.<area>]`, e.g. `com.superagent.task.automation`,
   `com.superagent.platform.provider`. Controllers stay in `com.superagent.web.<area>`.
 - **Business logic lives in the domain modules**, not in web: a controller only maps HTTP onto a service.

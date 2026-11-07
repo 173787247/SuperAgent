@@ -1,7 +1,7 @@
 package com.superagent.agent.memory;
 
+import com.superagent.platform.provider.CredentialService;
 import com.superagent.agent.log.AgentLogService;
-import com.superagent.api.knowledge.KnowledgeEntryDto;
 import com.superagent.core.agent.Agent;
 import com.superagent.core.agent.AgentMemoryState;
 import com.superagent.core.agent.AgentMemoryStateStore;
@@ -16,7 +16,6 @@ import com.superagent.core.chat.ChatMessage;
 import com.superagent.core.chat.ChatSession;
 import com.superagent.core.chat.ChatStore;
 import com.superagent.core.chat.SessionStatus;
-import com.superagent.knowledge.KnowledgeService;
 import com.superagent.platform.provider.ProviderService;
 import com.superagent.platform.settings.SettingsService;
 import jakarta.annotation.PreDestroy;
@@ -27,7 +26,6 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -38,7 +36,6 @@ import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,13 +45,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 /**
- * Agents' long-term memory: one Markdown file per agent in its owner's knowledge base
- * ({@code Agent 记忆/<name>（<id>）.md}), so the user can read and edit it. A background job
+ * Agents' long-term memory: one Markdown document per agent, kept with the agent; its owner can read and edit it
+ * (members can read it), from the agent's side panel. A background job
  * ({@link AgentMemoryLoop}) distils new conversation into it with the system default model; a session
  * that starts fresh (first turn, new model) gets it in its system prompt — see {@link AgentRunRequest}.
  *
  * <p>Memory belongs to the agent, not to a session: it spans every session the agent has had, so it is
- * what carries over when a model change starts a new one. Each run re-reads the file, so the user's
+ * what carries over when a model change starts a new one. Each run re-reads the document, so the user's
  * own edits are kept. Also tracks the model of the agent's current session ({@link #lastModel}).
  */
 @Service
@@ -66,12 +63,18 @@ public class AgentMemoryService {
 
     private final AgentStore agents;
     private final ChatStore chats;
-    private final KnowledgeService knowledge;
     private final AgentMemoryStateStore states;
     private final ProviderService providers;
     private final SettingsService settings;
     private final AgentLogService runLog;
     private final Map<AgentType, AgentRunner> runners = new EnumMap<>(AgentType.class);
+
+    private CredentialService credentials; // null in tests: runs use the server's environment
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setCredentials(CredentialService credentials) {
+        this.credentials = credentials;
+    }
     private final int minMessages;
     private final Duration settle;
     private final Duration idle;
@@ -89,7 +92,7 @@ public class AgentMemoryService {
     private final int failureLimit;
     private final int recentMessages;
 
-    public AgentMemoryService(AgentStore agents, ChatStore chats, KnowledgeService knowledge, AgentMemoryStateStore states,
+    public AgentMemoryService(AgentStore agents, ChatStore chats, AgentMemoryStateStore states,
                               ProviderService providers, SettingsService settings, List<AgentRunner> agentRunners,
                               @Value("${superagent.memory.min-messages:10}") int minMessages,
                               @Value("${superagent.memory.settle-minutes:2}") long settleMinutes,
@@ -101,7 +104,6 @@ public class AgentMemoryService {
                               AgentLogService runLog) {
         this.agents = agents;
         this.chats = chats;
-        this.knowledge = knowledge;
         this.states = states;
         this.providers = providers;
         this.settings = settings;
@@ -181,8 +183,36 @@ public class AgentMemoryService {
 
     /** The agent's memory document, or null when nothing worth remembering has been written yet. */
     public String read(Agent agent) {
-        return memoryFile(agent).map(e -> new String(knowledge.read(agent.owner(), e.path()).bytes(),
-                StandardCharsets.UTF_8)).filter(s -> !s.isBlank()).orElse(null);
+        return states.find(agent.id()).map(AgentMemoryState::memory).filter(s -> !s.isBlank()).orElse(null);
+    }
+
+    /** When the memory last changed (by distilling or by its owner), or null without one. */
+    public Instant updatedAt(Agent agent) {
+        return read(agent) == null ? null : states.find(agent.id()).map(AgentMemoryState::updatedAt).orElse(null);
+    }
+
+    /** True while a distilling run is going for the agent. */
+    public boolean distilling(String agentId) {
+        return inFlight.contains(agentId);
+    }
+
+    /** The owner's own edit; blank clears the memory. The next distilling builds on what they left. */
+    public void edit(Agent agent, String memory, String by) {
+        String text = memory == null || memory.isBlank() ? null : memory.strip();
+        if (text != null && text.length() > AgentMemoryRules.MAX_CHARS) {
+            throw new IllegalArgumentException("记忆不能超过 " + AgentMemoryRules.MAX_CHARS + " 字");
+        }
+        states.save(state(agent).withMemory(text));
+        runLog.info(agent, AgentLogService.MEMORY, text == null ? by + " 清空了记忆" : by + " 编辑了记忆", null);
+    }
+
+    /** Distils now whatever isn't in memory yet; false when there's nothing new or a run is already going. */
+    public boolean distillNow(Agent agent) {
+        if (undistilled(agent).isEmpty() || inFlight.contains(agent.id())) {
+            return false;
+        }
+        consolidateSoon(agent);
+        return true;
     }
 
     // --- the model of the current session ---
@@ -208,9 +238,8 @@ public class AgentMemoryService {
 
     // --- forgetting ---
 
-    /** Deletes the agent's memory file and its bookkeeping (when the agent itself is deleted). */
+    /** Deletes the agent's memory and its bookkeeping (when the agent itself is deleted). */
     public void forget(Agent agent) {
-        memoryFile(agent).ifPresent(e -> knowledge.delete(agent.owner(), e.path()));
         states.delete(agent.id());
         backoff.remove(agent.id());
     }
@@ -272,7 +301,7 @@ public class AgentMemoryService {
         String current = read(agent);
         String answer;
         try {
-            answer = summarize(AgentMemoryRules.prompt(agent.name(), current,
+            answer = summarize(agent, AgentMemoryRules.prompt(agent.name(), current,
                     AgentMemoryRules.transcript(fresh, zone)));
         } catch (RuntimeException e) {
             log.warn("memory run for agent {} failed, retrying later: {}", agent.id(), e.getMessage());
@@ -305,9 +334,26 @@ public class AgentMemoryService {
         backoff.remove(agent.id());
     }
 
-    /** One run of the system default model, no tools, in a scratch directory; returns its final text. */
-    private String summarize(String prompt) {
-        String model = settings.agentDefaultModel();
+    private com.superagent.core.usage.UsageRecorder usage; // null in tests: tokens aren't kept
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setUsageRecorder(com.superagent.core.usage.UsageRecorder usage) {
+        this.usage = usage;
+    }
+
+    private com.superagent.core.provider.ModelRouter modelRouter; // null in tests: the default model
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setModelRouter(com.superagent.core.provider.ModelRouter modelRouter) {
+        this.modelRouter = modelRouter;
+    }
+
+
+    /** One run of the cheapest model that can run (else the default), no tools, in a scratch directory; returns its final text. */
+    private String summarize(Agent agent, String prompt) {
+        String model = (modelRouter == null ? java.util.Optional.<com.superagent.core.provider.ModelRouter.ModelChoice>empty()
+                : modelRouter.cheapest()).map(com.superagent.core.provider.ModelRouter.ModelChoice::model)
+                .orElseGet(settings::agentDefaultModel);
         AgentType type = providers.cliFor(model).map(AgentType::fromString).filter(runners::containsKey)
                 .orElse(AgentType.CLAUDE);
         AgentRunner runner = runners.get(type);
@@ -333,7 +379,12 @@ public class AgentMemoryService {
         };
         try {
             runner.run(new AgentRunRequest(UUID.randomUUID().toString(), null, scratch.toString(), prompt, model,
-                    List.of(), false, null, null), sink, new Cancellation());
+                    List.of(), false, null, null, List.of(), null,
+                    credentials == null ? null : credentials.current(type.cliName()).credential()),
+                    // Keeping an agent's memory is part of using it: on its owner.
+                    com.superagent.core.usage.UsageRecorder.tap(usage, new com.superagent.core.usage.UsageContext(agent.owner(),
+                            com.superagent.core.usage.UsageContext.SOURCE_MEMORY, agent.id(), null, null, type.cliName()), sink),
+                    new Cancellation());
         } finally {
             deleteQuietly(scratch);
         }
@@ -345,21 +396,7 @@ public class AgentMemoryService {
     }
 
     private void write(Agent agent, String memory) {
-        String name = AgentMemoryRules.fileName(agent.name(), agent.id());
-        Optional<KnowledgeEntryDto> old = memoryFile(agent);
-        knowledge.writeText(agent.owner(), AgentMemoryRules.FOLDER, name, memory, true);
-        // The agent was renamed since the last write: drop the file under its old name.
-        old.filter(e -> !e.name().equals(name)).ifPresent(e -> knowledge.delete(agent.owner(), e.path()));
-    }
-
-    /** The agent's memory file, found by its id suffix so a rename doesn't lose it. */
-    private Optional<KnowledgeEntryDto> memoryFile(Agent agent) {
-        if (agent.owner() == null || !knowledge.folders(agent.owner()).contains(AgentMemoryRules.FOLDER)) {
-            return Optional.empty();
-        }
-        String suffix = AgentMemoryRules.idSuffix(agent.id());
-        return knowledge.list(agent.owner(), AgentMemoryRules.FOLDER).stream()
-                .filter(e -> !e.dir() && e.name().endsWith(suffix)).findFirst();
+        states.save(state(agent).withMemory(memory));
     }
 
     /** Every message of every session the agent has had, oldest first. */
@@ -374,7 +411,7 @@ public class AgentMemoryService {
 
     private AgentMemoryState state(Agent agent) {
         return states.find(agent.id()).orElseGet(() ->
-                new AgentMemoryState(agent.id(), agent.owner(), null, null, 0, Instant.now()));
+                new AgentMemoryState(agent.id(), agent.owner(), null, null, 0, null, Instant.now()));
     }
 
     @PreDestroy

@@ -16,13 +16,11 @@ public record CreateTaskRequest(
         String model,
         String agentType,
         String kind,
-        /** When true, the agent saves the task's main output to the creator's knowledge base. */
-        Boolean saveToKnowledge,
-        /** Target folder for that save; blank = let the agent pick (or create) a fitting one. */
-        String knowledgeFolder) {
+        /** The tier to run at, when tiers are on (null = the default tier); then {@code model} and {@code agentType} follow from it. */
+        String tier) {
 
     public CreateTaskRequest(String title, String brief, String source, String repo, String branch, String flow,
                              String model, String agentType, String kind) {
-        this(title, brief, source, repo, branch, flow, model, agentType, kind, null, null);
+        this(title, brief, source, repo, branch, flow, model, agentType, kind, null);
     }
 }

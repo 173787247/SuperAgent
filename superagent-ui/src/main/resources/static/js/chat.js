@@ -85,11 +85,12 @@ function beginEdit(msgEl, mid) {
 }
 
 // ---------- streaming bubbles ----------
-function addUserBubble(text, imageUrls) {
+function addUserBubble(text, imageUrls, fileNames) {
   clearEmptyState();
   const msg = document.createElement("div");
   msg.className = "msg msg--user";
   if (imageUrls && imageUrls.length) msg.appendChild(imageStrip(imageUrls));
+  if (fileNames && fileNames.length) msg.appendChild(fileNameChips(fileNames));
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.textContent = text;
@@ -335,12 +336,7 @@ function markActiveThread() {
 
 async function selectAgent(agent) {
   if (streaming) return;
-  if (liveRunning) { // was watching another member's turn on the previous agent
-    liveRunning = false;
-    liveBubble = null;
-    el.input.disabled = false;
-    el.input.placeholder = L("chat.composer");
-  }
+  stopLiveWatch(); // was watching a turn on the previous agent
   activeAgentId = agent.id;
   activeAgent = agent;
   renderAgentPanel(agent);
@@ -352,6 +348,7 @@ async function selectAgent(agent) {
     return;
   }
   await selectSession(agent.sessionId);
+  pollLive(); // reconnect at once if a turn this session started is still running on the server
 }
 
 function renderAgentPanel(agent) {
@@ -364,8 +361,10 @@ function renderAgentPanel(agent) {
   if (agent.kind === "super") avatar.replaceChildren(liquidCore("liquid-core--sm"));
   else avatar.textContent = agent.avatar || "🙂";
   const ch = characterByKey(agent.character);
-  document.getElementById("agentInfoCharacter").textContent = agent.kind === "super" ? L("super.role")
+  const roleLine = agent.kind === "super" ? L("super.role")
     : ch ? ch.emoji + " " + characterName(ch) : L("agent.characterCustom");
+  document.getElementById("agentInfoCharacter").textContent = roleLine;
+  document.getElementById("agentInfoSub").textContent = roleLine;
   const editBtn = document.getElementById("agentEditBtn");
   if (editBtn) editBtn.hidden = agent.kind === "super" || !isOwner(agent);
   document.getElementById("agentLogBtn").hidden = !isOwner(agent); // the run log is the owner's only
@@ -373,29 +372,70 @@ function renderAgentPanel(agent) {
   composerModel.title = isOwner(agent) ? "" : L("co.modelOwnerOnly");
   renderMembers(agent);
   panel.classList.toggle("agent-info--super", agent.kind === "super");
-  document.getElementById("agentInfoDetails").hidden = agent.kind === "super";
-  document.getElementById("superIntro").hidden = agent.kind !== "super";
+  // Every agent has a details drawer; the SuperAgent's holds only what it has (memory, run log, messages).
+  document.getElementById("agentDetailTitle").textContent = agent.name || "Agent";
+  document.getElementById("agentInfoDetails").classList.toggle("is-super", agent.kind === "super");
+  document.getElementById("superSources").hidden = agent.kind !== "super";
   if (agent.kind === "super") loadSuperSources();
+  renderAgentWork(agent);
   const persona = document.getElementById("agentInfoPersona");
   persona.textContent = agent.persona || "";
-  persona.hidden = !agent.persona;
+  document.getElementById("agentPersonaWrap").hidden = !agent.persona;
+  setupPersonaClamp();
   if (!characterChoices.length) loadCharacters().then(() => { if (activeAgent === agent && agent.character) renderAgentPanel(agent); });
-  const model = agent.model || systemSettings.agentDefaultModel || "default";
+  // Conversations run on what the admin set, not a model of each agent's own (the work runs in tasks).
+  const model = systemSettings.agentDefaultModel || "default";
   document.getElementById("agentInfoModel").textContent = model;
   renderComposerModel(agent);
   renderAgentSkills(agent);
 }
 
+// A long persona is clamped to a few lines with a show-more toggle; a short one shows in full.
+function setupPersonaClamp() {
+  const wrap = document.getElementById("agentPersonaWrap");
+  const more = document.getElementById("agentPersonaMore");
+  if (wrap.hidden) return;
+  wrap.classList.add("is-clamped");
+  const persona = document.getElementById("agentInfoPersona");
+  requestAnimationFrame(() => {
+    const overflows = persona.scrollHeight - persona.clientHeight > 2;
+    more.hidden = !overflows;
+    more.textContent = L("agent.personaMore");
+    if (!overflows) wrap.classList.remove("is-clamped");
+  });
+  more.onclick = () => {
+    const clamped = wrap.classList.toggle("is-clamped");
+    more.textContent = L(clamped ? "agent.personaMore" : "agent.personaLess");
+  };
+}
+
 // Composer model picker: the agent's model override, limited to Claude models the background probe saw answer.
 const composerModel = document.getElementById("statusHint");
 
+// No model has passed its probe: chatting can't work, so say so instead of offering a "Default" that would fail.
+let noChatModel = false;
+
+// Nobody picks a model for a conversation any more: the admin sets it (System Settings). The picker only shows to
+// say that no model can run at all.
 async function renderComposerModel(agent) {
-  const { groups } = await loadChatModels();
+  composerModel.hidden = true;
+  const { groups, failed } = await loadChatModels();
   if (activeAgent !== agent) return; // switched agents while loading
   composerModel.innerHTML = "";
+  setNoChatModel(!failed && !groups.length);
+  if (noChatModel) {
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = L("chat.noModel");
+    composerModel.appendChild(none);
+    composerModel.disabled = true;
+    return;
+  }
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = L("chat.modelDefault", { model: systemSettings.agentDefaultModel || L("settings.modelCliDefault") });
+  def.textContent = systemSettings.agentDefaultModel || failed || cliDefaultWorks(groups)
+    ? L("chat.modelDefault", { model: systemSettings.agentDefaultModel || L("settings.modelCliDefault") })
+    : L("settings.modelPick");
   composerModel.appendChild(def);
   fillModelGroups(composerModel, groups, m => m.id);
   // Show the truth when the saved model has since failed its probe, rather than silently displaying another.
@@ -405,19 +445,32 @@ async function renderComposerModel(agent) {
   composerModel.value = agent.model || "";
 }
 
+/** With no model chosen, a turn runs on Claude Code's own default: that only works if Claude Code has a working model. */
+const cliDefaultWorks = groups => groups.some(g => g.key === "claude");
+
+function setNoChatModel(on) {
+  noChatModel = on;
+  composerModel.hidden = !on;
+  el.composer.classList.toggle("composer--nomodel", on);
+  el.sendBtn.disabled = on;
+  el.input.setAttribute("placeholder", on ? L(isAdmin ? "chat.noModelAdmin" : "chat.noModelUser")
+    : superMode ? L("super.placeholder") : L("chat.composer"));
+}
+
 // Chat models across every runnable CLI (the backend runs a turn under the CLI that owns the chosen
 // model), keeping only those the background probe saw answer: being listed isn't enough.
 const CLI_LABELS = { claude: "Claude Code", codex: "Codex" };
 async function loadChatModels() {
   let options = [];
-  try { const res = await api.taskAgents(); options = (res && res.data) || []; } catch (e) { /* keep empty */ }
+  let failed = false; // couldn't ask: don't conclude there are no models
+  try { const res = await api.taskAgents(); options = (res && res.data) || []; } catch (e) { failed = true; }
   let listed = 0;
   const groups = options.map(o => {
     const models = o.models || [];
     listed += models.length;
-    return { label: CLI_LABELS[o.key] || o.name || o.key, models: models.filter(m => m.inferStatus === "ok") };
+    return { key: o.key, label: CLI_LABELS[o.key] || o.name || o.key, models: models.filter(m => m.inferStatus === "ok") };
   }).filter(g => g.models.length);
-  return { groups, listed };
+  return { groups, listed, failed };
 }
 
 function fillModelGroups(select, groups, label) {
@@ -434,18 +487,4 @@ function fillModelGroups(select, groups, label) {
   });
 }
 
-composerModel.addEventListener("change", async () => {
-  const agent = activeAgent;
-  if (!agent) return;
-  try {
-    const res = await api.updateAgent(agent.id, {
-      name: agent.name, avatar: agent.avatar, character: agent.character, persona: agent.persona,
-      model: composerModel.value || null,
-    });
-    activeAgent = res.data;
-    renderAgentPanel(res.data);
-  } catch (e) {
-    showToast(L("chat.modelSaveFailed"), true);
-    composerModel.value = agent.model || "";
-  }
-});
+// The picker only says that no model can run; it chooses nothing (the admin sets the model).

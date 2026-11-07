@@ -115,7 +115,7 @@ class TaskServiceTest {
 
     private TaskService service(AgentRunner runner, InMemoryTaskStore tasks, InMemoryTaskPhaseStore phases, int maxParallel) {
         return new TaskService(tasks, phases, new InMemoryTaskRunStateStore(), new InMemoryRunStore(), List.of(runner), IMAGES,
-                System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, maxParallel, "tester", null, null, null);
+                System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, maxParallel, "tester", null, null, null, null, null);
     }
 
     private static final class InMemoryTaskRunStateStore implements TaskRunStateStore {
@@ -360,11 +360,11 @@ class TaskServiceTest {
         RecordingRunner runner = new RecordingRunner(0);
         TaskService service = new TaskService(tasks, new InMemoryTaskPhaseStore(), new InMemoryTaskRunStateStore(),
                 new InMemoryRunStore(), List.of(runner), IMAGES,
-                System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, 5, "tester", null, null, null);
+                System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, 5, "tester", null, null, null, null, null);
         String id = service.create(brief("A")).id();
         awaitStatus(tasks, id, "DONE");
 
-        service.sendMessage(id, "tester", "", List.of(new ImageUploadDto("image/png", PNG))); // image-only is allowed
+        service.sendMessage(id, "tester", "", List.of(new ImageUploadDto("image/png", PNG)), List.of()); // image-only is allowed
         awaitStatus(tasks, id, "DONE");
         assertThat(runner.calls.get(1).images()).isEqualTo(1);
         assertThat(service.detail(id, "tester").messages()).filteredOn(m -> m.role().equals("user")).singleElement()
@@ -385,7 +385,7 @@ class TaskServiceTest {
         RecordingRunner runner = new RecordingRunner(0);
         String root = System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID();
         TaskService service = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES,
-                root, "", "", false, 5, "tester", null, null, null);
+                root, "", "", false, 5, "tester", null, null, null, null, null);
 
         String id = service.create(brief("A")).id();
         awaitStatus(tasks, id, "DONE");
@@ -402,7 +402,7 @@ class TaskServiceTest {
 
         // A new process starts with an empty pool: steering must still resume the same session.
         TaskService restarted = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES,
-                root, "", "", false, 5, "tester", null, null, null);
+                root, "", "", false, 5, "tester", null, null, null, null, null);
         restarted.sendMessage(id, "tester", "one more fix");
         awaitStatus(tasks, id, "DONE");
         RecordingRunner.Call afterRestart = runner.calls.get(2);
@@ -456,7 +456,7 @@ class TaskServiceTest {
         List<RecordingRunner.Call> codex = Collections.synchronizedList(new ArrayList<>());
         TaskService service = new TaskService(tasks, new InMemoryTaskPhaseStore(), new InMemoryTaskRunStateStore(),
                 new InMemoryRunStore(), List.of(new TypedRunner(AgentType.CLAUDE, claude), new TypedRunner(AgentType.CODEX, codex)), IMAGES,
-                System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, 5, "tester", null, null, null);
+                System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID(), "", "", false, 5, "tester", null, null, null, null, null);
 
         String a = service.create(briefFor("A", "claude", null)).id();
         awaitStatus(tasks, a, "DONE");
@@ -479,11 +479,11 @@ class TaskServiceTest {
         InMemoryRunStore runStore = new InMemoryRunStore();
         RecordingRunner runner = new RecordingRunner(0);
         String root = System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID();
-        TaskService first = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null);
+        TaskService first = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null, null, null);
         String a = first.create(brief("A")).id();
         awaitStatus(tasks, a, "DONE");
 
-        TaskService restarted = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null);
+        TaskService restarted = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null, null, null);
         String b = restarted.create(brief("B")).id();
         awaitStatus(tasks, b, "DONE");
         assertThat(runner.calls.get(1).sessionId()).isEqualTo(runner.calls.get(0).sessionId());
@@ -556,7 +556,7 @@ class TaskServiceTest {
         InMemoryRunStore runStore = new InMemoryRunStore();
         RecordingRunner runner = new RecordingRunner(0);
         String root = System.getProperty("java.io.tmpdir") + "/sa-test-" + UUID.randomUUID();
-        TaskService first = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null);
+        TaskService first = new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null, null, null);
         String a = first.create(brief("A")).id();
         awaitStatus(tasks, a, "DONE");
         // Simulate the crash window: message stored and task PENDING, but the in-memory queue is gone.
@@ -564,7 +564,7 @@ class TaskServiceTest {
                 com.superagent.core.chat.MessageRole.USER, "please continue", Instant.now()));
         tasks.save(tasks.findTask(a).orElseThrow().withStatus(com.superagent.core.task.TaskStatus.PENDING));
 
-        new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null);
+        new TaskService(tasks, phases, runStates, runStore, List.of(runner), IMAGES, root, "", "", false, 5, "tester", null, null, null, null, null);
         awaitStatus(tasks, a, "DONE");
         assertThat(runner.calls).hasSize(2);
         assertThat(runner.calls.get(1).resumeId()).isEqualTo(runner.calls.get(0).sessionId());
@@ -591,5 +591,88 @@ class TaskServiceTest {
         awaitStatus(tasks, id, "DONE");
         assertThat(prompts.get(phaseTurns)).isEqualTo("咋没效果，需要重新编译吗");
         assertThat(service.detail(id, "tester").messages()).anyMatch(m -> m.role().equals("assistant") && m.content().contains("已完成"));
+    }
+
+    /**
+     * A new task is only recorded; the scheduler admits it, its model is chosen first, and when it fails on that model
+     * it moves up a tier and starts over, every decision kept.
+     */
+    @Test
+    void aTaskWaitsForTheSchedulerRunsOnTheChosenModelAndMovesUpWhenItFails() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        List<String> models = Collections.synchronizedList(new ArrayList<>());
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                models.add(req.model());
+                boolean cheap = "cheap".equals(req.model());
+                sink.emit(new AgentEvent(req.sessionId(), null, 0, cheap ? AgentEventType.ERROR : AgentEventType.RESULT,
+                        cheap ? "not up to it" : "done well", Instant.now()));
+            }
+        };
+        List<com.superagent.core.task.TaskModelChoice> kept = Collections.synchronizedList(new ArrayList<>());
+        com.superagent.core.task.TaskModelChoiceStore store = new com.superagent.core.task.TaskModelChoiceStore() {
+            @Override public void save(com.superagent.core.task.TaskModelChoice c) { kept.add(c); }
+            @Override public List<com.superagent.core.task.TaskModelChoice> list(String id) {
+                return kept.stream().filter(c -> c.taskId().equals(id)).toList();
+            }
+        };
+        com.superagent.core.task.TaskModelSelector selector = new com.superagent.core.task.TaskModelSelector() {
+            @Override public boolean enabled() { return true; }
+            @Override public Optional<com.superagent.core.task.TaskModelChoice> choose(Task t) {
+                return Optional.of(new com.superagent.core.task.TaskModelChoice(t.id(), 0, "judge", "easy", "fast", "cheap",
+                        "claude", "judge-model", "- cheap\n- strong", "easy one", Instant.now()));
+            }
+            @Override public Optional<com.superagent.core.task.TaskModelChoice> escalate(Task t, String failure) {
+                return "cheap".equals(t.model()) ? Optional.of(new com.superagent.core.task.TaskModelChoice(t.id(), 0,
+                        "escalation", null, "strong", "strong", "claude", null, null, failure, Instant.now())) : Optional.empty();
+            }
+        };
+        TaskService service = service(runner, tasks);
+        service.setModelSelection(selector, store);
+        service.useScheduler(() -> { });
+
+        String id = service.create(brief("整理会议纪要")).id();
+        assertThat(tasks.findTask(id).orElseThrow().status().name()).isEqualTo("PENDING");
+        assertThat(models).isEmpty(); // recorded, not run
+
+        service.awaitingAdmission().forEach(service::admit);
+        await().atMost(Duration.ofSeconds(5)).until(() -> service.awaitingAdmission().size() == 1
+                && "strong".equals(tasks.findTask(id).orElseThrow().model())); // failed on cheap, queued again one tier up
+        service.awaitingAdmission().forEach(service::admit);
+        awaitStatus(tasks, id, "DONE");
+
+        assertThat(models).containsExactly("cheap", "strong");
+        assertThat(service.modelChoices(id, "tester")).extracting(c -> c.by() + ":" + c.model() + "#" + c.seq())
+                .containsExactly("judge:cheap#1", "escalation:strong#2");
+        assertThat(service.modelChoices(id, "tester").get(1).reasoning()).contains("not up to it");
+    }
+
+    @Test
+    void withTiersOffATaskSaysWhyItRunsOnItsModel() {
+        InMemoryTaskStore tasks = new InMemoryTaskStore();
+        List<com.superagent.core.task.TaskModelChoice> kept = Collections.synchronizedList(new ArrayList<>());
+        com.superagent.core.task.TaskModelChoiceStore store = new com.superagent.core.task.TaskModelChoiceStore() {
+            @Override public void save(com.superagent.core.task.TaskModelChoice c) { kept.add(c); }
+            @Override public List<com.superagent.core.task.TaskModelChoice> list(String id) {
+                return kept.stream().filter(c -> c.taskId().equals(id)).toList();
+            }
+        };
+        AgentRunner runner = new AgentRunner() {
+            @Override public AgentType type() { return AgentType.CLAUDE; }
+            @Override public void run(AgentRunRequest req, AgentEventSink sink, Cancellation c) {
+                sink.emit(new AgentEvent(req.sessionId(), null, 0, AgentEventType.RESULT, "ok", Instant.now()));
+            }
+        };
+        TaskService service = service(runner, tasks);
+        service.setModelSelection(null, store);
+        service.useScheduler(() -> { });
+
+        String id = service.create(new CreateTaskRequest("整理纪要", "x", null, null, null, null, "claude-opus-5-5", null, null)).id();
+        assertThat(service.modelChoices(id, "tester")).singleElement().satisfies(c -> {
+            assertThat(c.by()).isEqualTo("default");
+            assertThat(c.model()).isEqualTo("claude-opus-5-5");
+            assertThat(c.reasoning()).contains("没有开启模型分档", "指定了 claude-opus-5-5");
+        });
     }
 }

@@ -10,11 +10,12 @@ Object.assign(api, {
   taskDetail: id => fetch("/api/v1/tasks/" + id).then(r => r.json()),
   taskAgents: () => fetch("/api/v1/tasks/agents").then(r => r.json()),
   taskStatus: id => fetch("/api/v1/tasks/" + id + "/status").then(r => r.json()),
+  taskModelChoices: id => fetch("/api/v1/tasks/" + id + "/model-choices").then(r => r.json()),
   taskEvents: (id, offset) => fetch("/api/v1/tasks/" + id + "/events?offset=" + offset).then(r => r.json()),
-  taskArtifacts: id => fetch("/api/v1/tasks/" + id + "/artifacts").then(r => r.json()),
-  taskMessage: (id, content, images) => fetch("/api/v1/tasks/" + id + "/messages", {
+  taskFiles: id => fetch("/api/v1/files?task=" + encodeURIComponent(id)).then(kbJson),
+  taskMessage: (id, content, images, fileIds) => fetch("/api/v1/tasks/" + id + "/messages", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content, images: images || [] }),
+    body: JSON.stringify({ content, images: images || [], fileIds: fileIds || [] }),
   }),
   stopTask: id => fetch("/api/v1/tasks/" + id + "/stop", { method: "POST" }),
   deleteTask: id => fetch("/api/v1/tasks/" + id, { method: "DELETE" }),
@@ -48,8 +49,8 @@ const tel = {
   tabs: document.getElementById("taskTabs"),
   runPane: document.getElementById("taskRunPane"),
   sessionInfo: document.getElementById("taskSessionInfo"),
-  artifacts: document.getElementById("taskArtifacts"),
-  artifactsEmpty: document.getElementById("taskArtifactsEmpty"),
+  files: document.getElementById("taskFiles"),
+  filesEmpty: document.getElementById("taskFilesEmpty"),
   progress: document.querySelector("#taskDetailView .progress"),
   progressBar: document.getElementById("taskProgressBar"),
   progressPct: document.getElementById("taskProgressPct"),
@@ -57,11 +58,14 @@ const tel = {
   phasesPanel: document.getElementById("taskPhasesPanel"),
   phases: document.getElementById("taskPhases"),
   steerForm: document.getElementById("taskSteerForm"),
+  confirmBar: document.getElementById("taskConfirmBar"),
+  confirmGo: document.getElementById("taskConfirmGo"),
+  confirmEdit: document.getElementById("taskConfirmEdit"),
   steerInput: document.getElementById("taskSteerInput"),
   steerBtn: document.getElementById("taskSteerBtn"),
 };
 
-const task = { id: null, renderedEvents: 0, mergeEl: null, mergeType: null, pollTimer: null };
+const task = { id: null, renderedEvents: 0, mergeEl: null, mergeType: null, toolGroup: null, pollTimer: null };
 
 function isActiveStatus(s) { return s === "running" || s === "pending"; }
 
@@ -210,7 +214,7 @@ function taskRow(t) {
   const agentName = document.createElement("div");
   agentName.textContent = agentLabel(t.agentType);
   const modelName = document.createElement("small");
-  modelName.textContent = t.model || L("tasks.modelDefault");
+  modelName.textContent = taskModelLabel(t);
   tdAgent.append(agentName, modelName);
 
   const tdSource = document.createElement("td");
@@ -278,6 +282,7 @@ async function openTask(id) {
   task.renderedEvents = 0;
   task.mergeEl = null;
   task.mergeType = null;
+  task.toolGroup = null;
   tel.listView.hidden = true;
   tel.detailView.hidden = false;
   tel.stream.innerHTML = "";
@@ -305,7 +310,8 @@ function renderDetail(d) {
   tel.stream.innerHTML = "";
   task.mergeEl = null;
   task.mergeType = null;
-  timeline.forEach(appendStreamItem);
+  task.toolGroup = null;
+  coalesce(timeline).forEach(appendStreamItem);
   task.renderedEvents = (d.events || []).length;
   if (timeline.length === 0) {
     const empty = document.createElement("p");
@@ -319,17 +325,98 @@ function renderDetail(d) {
   renderSessionInfo(t);
   renderPhases(d.phases);
   task.hasPhases = !!(d.phases && d.phases.length);
+  // Only a task with a flow of its own (coding) has phases; the rest just run.
+  tel.tabs.querySelector('[data-tab="run"]').textContent = task.hasPhases
+    ? L("tasks.tabRunPhased", { n: d.phases.length }) : L("tasks.tabRun");
   if (tel.promptBody) tel.promptBody.innerHTML = renderMarkdown(d.brief || t.title || "");
-  setTaskTab("run");
-  loadArtifacts(t.id);
+  // A finished task opens on what it came up with; one still at work on its run log.
+  const last = [...(d.events || [])].reverse().find(e => e.type === "result");
+  renderTaskOutput(last ? last.payload : null, t);
+  setTaskTab(last && t.status === "done" ? "output" : "run");
+  loadTaskFiles(t.id);
+  task.choiceKey = t.status + "|" + t.model;
+  loadModelChoices(t);
+  loadTaskUsage(t.id);
+  task.lastPhaseKey = t.status + "|" + t.progress;
   if (isActiveStatus(t.status)) startTaskPolling(); else stopTaskPolling();
 }
 
-// Detail tabs: Prompt / Conversation (run log + coding phases, the default) / Session.
+// The "model choice" tab: before the task runs, how hard it was judged, what it could have run on and what was
+// picked, and why; then one more entry each time it failed and moved to a dearer model.
+const CHOICE_BY = ["judge", "user", "fallback", "escalation", "default"];
+
+async function loadModelChoices(t) {
+  const box = document.getElementById("taskModelChoices");
+  let list = [];
+  try { list = ((await api.taskModelChoices(t.id)) || {}).data || []; } catch (e) { /* keep what's shown */ return; }
+  if (task.id !== t.id) return;
+  box.replaceChildren();
+  if (!list.length) {
+    const p = document.createElement("p");
+    p.className = "model-choices__empty";
+    p.textContent = t.status === "pending" ? L("tasks.choicePending") : L("tasks.choiceNone", { model: t.model || L("tasks.modelDefault") });
+    box.appendChild(p);
+    return;
+  }
+  list.forEach(c => box.appendChild(modelChoiceCard(c)));
+}
+
+function modelChoiceCard(c) {
+  const card = document.createElement("section");
+  card.className = "model-choice is-" + c.by;
+  const head = document.createElement("div");
+  head.className = "model-choice__head";
+  const by = document.createElement("span");
+  by.className = "model-choice__by";
+  by.textContent = CHOICE_BY.includes(c.by) ? L("tasks.choiceBy." + c.by) : c.by;
+  const when = document.createElement("span");
+  when.className = "model-choice__when";
+  when.textContent = formatDateTime(c.createdAt);
+  head.append(by, when);
+  const facts = document.createElement("dl");
+  facts.className = "model-choice__facts";
+  const row = (k, v) => { if (!v) return; const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v; facts.append(dt, dd); };
+  row(L("tasks.choiceDifficulty"), c.difficulty ? L("tasks.difficulty." + c.difficulty) : null);
+  row(L("tasks.choiceModel"), [c.model, c.cli].filter(Boolean).join(" · "));
+  row(L("tasks.choiceJudge"), c.judge);
+  card.append(head, facts);
+  if (c.reasoning) {
+    const why = document.createElement("p");
+    why.className = "model-choice__why";
+    why.textContent = c.reasoning;
+    card.appendChild(why);
+  }
+  if (c.candidates) {
+    const more = document.createElement("details");
+    more.className = "model-choice__candidates";
+    const sum = document.createElement("summary");
+    sum.textContent = L("tasks.choiceCandidates", { n: c.candidates.split("\n").length });
+    const pre = document.createElement("pre");
+    pre.textContent = c.candidates;
+    more.append(sum, pre);
+    card.appendChild(more);
+  }
+  return card;
+}
+
+// The task's output: its final reply (what it came up with). Not a file: files are what it saved on purpose.
+function renderTaskOutput(text, t) {
+  const box = document.getElementById("taskOutput");
+  if (text) { box.innerHTML = renderMarkdown(text); return; }
+  box.innerHTML = "";
+  const p = document.createElement("p");
+  p.className = "task-output__empty";
+  p.textContent = L(t && (t.status === "error" || t.status === "stopped") ? "tasks.outputNone" : "tasks.outputWaiting");
+  box.appendChild(p);
+}
+
+// Detail tabs: Prompt / Model choice / Conversation (run log + coding phases) / Output / Session.
 function setTaskTab(tab) {
   tel.tabs.querySelectorAll(".model-tab").forEach(b => b.classList.toggle("is-active", b.dataset.tab === tab));
   tel.detailView.querySelectorAll("[data-pane-tab]").forEach(p => { p.hidden = p.dataset.paneTab !== tab; });
   if (tab === "run") scrollRunToEnd();
+  if (tab === "usage" && task.id) loadTaskUsage(task.id); // a running task keeps adding up
 }
 tel.tabs.addEventListener("click", e => {
   const b = e.target.closest(".model-tab");
@@ -343,30 +430,49 @@ function scrollRunToEnd() {
   requestAnimationFrame(scrollStream);
 }
 
-async function loadArtifacts(id) {
-  let list = [];
-  try { const res = await api.taskArtifacts(id); list = (res && res.data) || []; } catch (e) { /* ignore */ }
-  tel.artifacts.innerHTML = "";
-  tel.artifactsEmpty.hidden = list.length > 0;
-  list.forEach(a => {
-    const li = document.createElement("li");
-    const link = document.createElement("a");
-    link.href = "/api/v1/tasks/" + id + "/artifacts/" + encodeURIComponent(a.name);
-    link.setAttribute("download", a.name);
-    const name = document.createElement("span");
-    name.textContent = a.name;
-    const size = document.createElement("span");
-    size.className = "artifact-size";
-    size.textContent = formatBytes(a.size);
-    link.append(name, size);
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "link-btn artifact-kb";
-    save.textContent = L("tasks.saveToKb");
-    save.addEventListener("click", () => saveArtifactToKb(id, a.name));
-    li.append(link, save);
-    tel.artifacts.appendChild(li);
+/**
+ * The agent's reply is stored as it streamed, a few characters per event: a long task has thousands. Rendering each
+ * one re-parsed the whole reply as Markdown every time (quadratic: one task here parsed 55 million characters on
+ * open and froze the page). Runs of text or thinking are joined first, so each block renders once.
+ */
+function coalesce(items) {
+  const out = [];
+  items.forEach(item => {
+    const prev = out[out.length - 1];
+    if (prev && (item.kind === "text" || item.kind === "thinking") && prev.kind === item.kind) {
+      prev.payload = (prev.payload || "") + (item.payload || "");
+    } else {
+      out.push({ ...item });
+    }
   });
+  return out;
+}
+
+// What the task produced, from Files: its delivery and anything its agent saved. A click opens the preview.
+async function loadTaskFiles(id) {
+  const list = await api.taskFiles(id).catch(() => []);
+  if (task.id !== id) return; // another task was opened meanwhile
+  tel.files.replaceChildren(...(list || []).map(f => {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "task-file";
+    btn.title = f.name;
+    const icon = document.createElement("span");
+    icon.className = "task-file__icon";
+    icon.textContent = fileIcon(f);
+    const name = document.createElement("span");
+    name.className = "task-file__name";
+    name.textContent = f.name;
+    const size = document.createElement("span");
+    size.className = "task-file__size";
+    size.textContent = f.kind === "link" ? "" : formatBytes(f.size);
+    btn.append(icon, name, size);
+    btn.addEventListener("click", () => openFile(f));
+    li.appendChild(btn);
+    return li;
+  }));
+  tel.filesEmpty.hidden = (list || []).length > 0;
 }
 
 function formatBytes(n) {
@@ -415,7 +521,15 @@ function setEvBody(bodyEl, kind, fullRaw) {
 
 function appendStreamItem(item) {
   const type = item.kind;
-  if (type === "system") return; // bootstrap noise
+  // The CLI's own system events carry just its session id: noise. SuperAgent's notes (moving to a stronger
+  // model after a failure) are worth showing.
+  if (type === "system" && (!item.payload || /^[0-9a-f-]{36}$/i.test(item.payload.trim()))) return;
+
+  // A run of tool calls folds into one compact, collapsible block (one row per call).
+  if (type === "tool_use" || type === "tool_result") { appendToolEvent(item); return; }
+  // Any non-tool event ends the current tool group, so the next call starts a fresh one.
+  task.toolGroup = null;
+
   const mergeable = type === "text" || type === "thinking";
   if (mergeable && task.mergeType === type && task.mergeEl) {
     const bodyEl = task.mergeEl.querySelector(".ev__body");
@@ -440,10 +554,11 @@ function appendStreamItem(item) {
     ev.appendChild(lab);
   }
   if (item.images && item.images.length) ev.appendChild(imageStrip(item.images));
+  if (item.files && item.files.length) ev.appendChild(fileNameChips(item.files));
   const body = document.createElement("div");
   body.className = "ev__body";
   setEvBody(body, type, item.payload || "");
-  body.hidden = type === "cmd" && !item.payload && !!(item.images && item.images.length);
+  body.hidden = type === "cmd" && !item.payload && !!((item.images && item.images.length) || (item.files && item.files.length));
   ev.appendChild(body);
   tel.stream.appendChild(ev);
 
@@ -456,6 +571,100 @@ const EV_LABEL = {
   thinking: L("ev.think"), tool_use: L("ev.tool"), tool_result: L("ev.toolResult"),
   result: L("ev.result"), error: L("ev.error"), cmd: "",
 };
+
+// Consecutive tool calls collapse into one block: a "N tool calls" header over one row per call
+// (✓ Used tool: name, or a spinner + Using tool while it runs). Clicking a row reveals its result.
+function ensureToolGroup() {
+  if (task.toolGroup) return task.toolGroup;
+  const placeholder = tel.stream.querySelector(".task-stream__empty");
+  if (placeholder) placeholder.remove();
+  const el = document.createElement("div");
+  el.className = "ev ev--tools";
+  el.dataset.type = "tool";
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "evtools__head";
+  head.setAttribute("aria-expanded", "true");
+  const chev = document.createElement("span");
+  chev.className = "evtools__chev";
+  const count = document.createElement("span");
+  count.className = "evtools__count";
+  head.append(chev, count);
+  const list = document.createElement("div");
+  list.className = "evtools__list";
+  head.addEventListener("click", () => {
+    const open = head.getAttribute("aria-expanded") === "true";
+    head.setAttribute("aria-expanded", String(!open));
+    list.hidden = open;
+  });
+  el.append(head, list);
+  tel.stream.appendChild(el);
+  task.mergeEl = null;
+  task.mergeType = null;
+  task.toolGroup = { list, count, n: 0, pendingRow: null };
+  return task.toolGroup;
+}
+
+function appendToolEvent(item) {
+  const g = ensureToolGroup();
+  if (item.kind === "tool_use") {
+    g.pendingRow = addToolRow(g, "using", item.payload || "", "");
+  } else { // tool_result: fill in the call it belongs to, or stand alone if orphaned
+    if (g.pendingRow) finishToolRow(g.pendingRow, item.payload || "");
+    else addToolRow(g, "done", "", item.payload || "");
+    g.pendingRow = null;
+  }
+  scrollStream();
+}
+
+function addToolRow(g, state, name, result) {
+  const row = document.createElement("div");
+  row.className = "evtool is-" + state;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "evtool__row";
+  const icon = document.createElement("span");
+  icon.className = "evtool__icon";
+  const text = document.createElement("span");
+  text.className = "evtool__text";
+  const lead = document.createElement("span");
+  lead.className = "evtool__lead";
+  lead.textContent = L(state === "using" ? "ev.usingTool" : "ev.usedTool");
+  const nameEl = document.createElement("b");
+  nameEl.textContent = name;
+  text.append(lead, nameEl);
+  const chev = document.createElement("span");
+  chev.className = "evtool__chev";
+  btn.append(icon, text, chev);
+  const detail = document.createElement("div");
+  detail.className = "evtool__detail";
+  detail.hidden = true;
+  const body = document.createElement("div");
+  body.className = "ev__body";
+  detail.appendChild(body);
+  btn.addEventListener("click", () => {
+    if (row.dataset.hasDetail !== "1") return;
+    const open = row.dataset.open === "1";
+    row.dataset.open = open ? "0" : "1";
+    detail.hidden = open;
+  });
+  row.append(btn, detail);
+  g.list.appendChild(row);
+  g.n += 1;
+  g.count.textContent = L(g.n === 1 ? "ev.toolCall" : "ev.toolCalls", { n: g.n });
+  const handle = { row, lead, body };
+  if (result) finishToolRow(handle, result);
+  return handle;
+}
+
+function finishToolRow(handle, result) {
+  handle.row.className = "evtool is-done";
+  handle.lead.textContent = L("ev.usedTool");
+  if ((result || "").trim()) {
+    handle.body.textContent = result;
+    handle.row.dataset.hasDetail = "1";
+  }
+}
 
 // The run pane is the scrolling container (the stream itself never overflows).
 function scrollStream() { tel.runPane.scrollTop = tel.runPane.scrollHeight; }
@@ -475,12 +684,51 @@ function updateStatusUi(t) {
   const waiting = t.status === "pending" && !!t.sessionId;
   tel.steerInput.placeholder = waiting ? L("tasks.steerWaiting") : busy ? L("tasks.steerBusy") : L("tasks.steer");
   tel.stopBtn.disabled = !busy;
+  renderConfirmBar(t);
+}
+
+// ---------- a decision the task is waiting for ----------
+// The agent stops with a "NEEDS_CONFIRMATION:" question (the last message in the stream); small buttons in the
+// reply box answer it in one click, and anything more goes in the box itself.
+function renderConfirmBar(t) {
+  const waiting = t.status === "needs_confirmation";
+  tel.confirmBar.hidden = !waiting;
+  tel.steerForm.classList.toggle("has-confirm", waiting);
+  if (waiting) tel.confirmGo.disabled = false;
+}
+
+tel.confirmGo.addEventListener("click", async () => {
+  if (!task.id) return;
+  const text = L("tasks.confirmReply");
+  tel.confirmGo.disabled = true;
+  const res = await api.taskMessage(task.id, text, [], []).catch(() => null);
+  if (!res || !res.ok) {
+    const body = res && await res.json().catch(() => null);
+    showToast((body && body.message) || L("tasks.steerFailed"), true);
+    tel.confirmGo.disabled = false;
+    return;
+  }
+  tel.confirmBar.hidden = true;
+  tel.steerForm.classList.remove("has-confirm");
+  setTaskTab("run");
+  appendStreamItem({ kind: "cmd", payload: text });
+  startTaskPolling();
+});
+tel.confirmEdit.addEventListener("click", () => {
+  tel.steerInput.focus();
+  tel.steerInput.placeholder = L("tasks.confirmEditPh");
+});
+
+// The model a task ran on (chosen for it before it started).
+function taskModelLabel(t) {
+  const model = t.model || L("tasks.modelDefault");
+  return model;
 }
 
 function renderFacts(t) {
   const facts = [
     [L("tasks.agent"), agentLabel(t.agentType)],
-    [L("tasks.model"), t.model || L("tasks.modelDefault")],
+    [L("tasks.model"), taskModelLabel(t)],
     // No effort setting exists yet: tasks run at the CLI's default.
     [L("tasks.effort"), L("tasks.effortDefault"), L("tasks.effortHint")],
     [L("tasks.session"), t.sessionId ? t.sessionId.slice(0, 8) : "—", t.sessionId || ""],
@@ -500,7 +748,7 @@ function renderSessionInfo(t) {
     [L("tasks.sessionState"), state],
     [L("tasks.workspace"), t.workspaceDir || "—"],
     [L("tasks.agentType"), t.agentType ? agentLabel(t.agentType) + " (" + t.agentType + ")" : "—"],
-    [L("tasks.model"), t.model || L("tasks.modelDefault")],
+    [L("tasks.model"), taskModelLabel(t)],
     [L("tasks.effort"), L("tasks.effortDefault"), L("tasks.effortHint")],
   ]);
 }
@@ -552,12 +800,20 @@ function renderPhases(phases) {
   });
 }
 
+// One poll at a time: the next is scheduled when this one is done, so a slow answer never overlaps the next
+// (overlapping polls read the same offset and drew the same events twice).
 function startTaskPolling() {
   stopTaskPolling();
-  task.pollTimer = setInterval(pollTask, 1500);
+  task.polling = true;
+  task.pollTimer = setTimeout(pollLoop, 1500);
 }
 function stopTaskPolling() {
-  if (task.pollTimer) { clearInterval(task.pollTimer); task.pollTimer = null; }
+  task.polling = false;
+  if (task.pollTimer) { clearTimeout(task.pollTimer); task.pollTimer = null; }
+}
+async function pollLoop() {
+  await pollTask();
+  if (task.polling) task.pollTimer = setTimeout(pollLoop, 1500);
 }
 
 async function pollTask() {
@@ -565,18 +821,26 @@ async function pollTask() {
   if (!id) { stopTaskPolling(); return; }
   try {
     const [evRes, stRes] = await Promise.all([api.taskEvents(id, task.renderedEvents), api.taskStatus(id)]);
+    if (task.id !== id) return; // another task was opened meanwhile
     const newEvents = (evRes && evRes.data) || [];
-    newEvents.forEach(e => appendStreamItem({ kind: e.type, payload: e.payload, at: e.createdAt }));
+    coalesce(newEvents.map(e => ({ kind: e.type, payload: e.payload, at: e.createdAt }))).forEach(appendStreamItem);
     task.renderedEvents += newEvents.length;
+    const result = [...newEvents].reverse().find(e => e.type === "result");
+    if (result) renderTaskOutput(result.payload, null);
     const t = stRes && stRes.data;
     if (!t) return;
     updateStatusUi(t);
     renderFacts(t);
     renderSessionInfo(t);
-    if (task.hasPhases) {
+    // The model is decided before the task starts, and again whenever it moves to a dearer one after failing.
+    if (task.choiceKey !== t.status + "|" + t.model) { task.choiceKey = t.status + "|" + t.model; loadModelChoices(t); loadTaskUsage(t.id); }
+    // Phases only change when the task moves on: refetch the (large) detail then, not every poll.
+    const phaseKey = t.status + "|" + t.progress;
+    if (task.hasPhases && phaseKey !== task.lastPhaseKey) {
+      task.lastPhaseKey = phaseKey;
       try { const dRes = await api.taskDetail(id); if (dRes && dRes.data) renderPhases(dRes.data.phases); } catch (e) { /* ignore */ }
     }
-    if (!isActiveStatus(t.status)) { stopTaskPolling(); loadArtifacts(id); }
+    if (!isActiveStatus(t.status)) { stopTaskPolling(); loadTaskFiles(id); }
   } catch (e) { /* ignore transient poll errors */ }
 }
 
@@ -595,18 +859,22 @@ tel.steerForm.addEventListener("submit", async e => {
   if ((!text && taskImages.count() === 0) || !task.id) return;
   let res;
   try {
-    res = await api.taskMessage(task.id, text, await taskImages.payload());
-  } catch (err) { res = null; }
+    // Attachments go to Files first (under this task); the message then carries their ids.
+    const fileIds = taskImages.count() ? await taskImages.upload({ task: task.id }) : [];
+    res = await api.taskMessage(task.id, text, [], fileIds);
+  } catch (err) { showToast(err.message || L("tasks.steerFailed"), true); return; }
   if (!res || !res.ok) {
-    showToast(L("tasks.steerFailed"), true); // keep the text and images so they can be resent
+    const body = res && await res.json().catch(() => null);
+    showToast((body && body.message) || L("tasks.steerFailed"), true); // keep the text and files so they can be resent
     return;
   }
   const urls = taskImages.previewUrls();
+  const names = taskImages.fileNames();
   tel.steerInput.value = "";
   autoGrowSteer();
   taskImages.clear();
   setTaskTab("run");
-  appendStreamItem({ kind: "cmd", payload: text, images: urls });
+  appendStreamItem({ kind: "cmd", payload: text, images: urls, files: names });
   startTaskPolling();
 });
 tel.steerInput.addEventListener("keydown", e => {

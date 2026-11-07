@@ -1,13 +1,12 @@
-// SuperAgent UI — Skills: working standards in three layers (personal / team / company) — list, view, edit, images.
+// SuperAgent UI — Skills: working standards, personal or company-wide — list, view, edit, images.
 // Classic script sharing one global scope with the others; index.html loads them in order.
 "use strict";
 
 // ---------- skills ----------
-// Working standards; a skill lives in a layer with the knowledge base's rules (team skills reach sub-teams,
+// Working standards; a skill is the user's own or the company's (everyone uses it, only admins change it).
 // company skills everyone). Agents get the skills attached to them; their tasks inherit those.
 Object.assign(api, {
   listSkills: () => fetch("/api/v1/skills").then(kbJson),
-  skillSpaces: () => fetch("/api/v1/knowledge/spaces").then(kbJson),
   createSkill: body => kbPost("/api/v1/skills", body),
   updateSkill: (id, body) => fetch("/api/v1/skills/" + id, {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -21,9 +20,16 @@ const skillImageUrl = (id, name) => "/api/v1/skills/" + id + "/images/" + encode
 
 const skPane = document.querySelector('[data-pane="skills"]');
 const skel = {
-  list: document.getElementById("skList"),
+  grid: document.getElementById("skGrid"),
+  count: document.getElementById("skCount"),
+  empty: document.getElementById("skEmpty"),
   search: document.getElementById("skSearch"),
+  source: document.getElementById("skSource"),
+  owner: document.getElementById("skOwner"),
+  state: document.getElementById("skState"),
+  mine: document.getElementById("skMineBtn"),
   newBtn: document.getElementById("skNewBtn"),
+  drawer: document.getElementById("skDrawer"),
   heading: document.getElementById("skHeading"),
   actions: document.getElementById("skActions"),
   edit: document.getElementById("skEditBtn"),
@@ -44,8 +50,12 @@ const skel = {
   cancel: document.getElementById("sfCancel"),
 };
 let skills = [];             // SkillDto[] from the server
-let skSelectedId = null;
+let skMineOnly = false;      // "My skills": only the ones I created
+let skPeople = {};           // username → display name, for the cards
+let skSelectedId = null;     // the skill open in the drawer (set before setView("skills") to open one)
 let skEditing = null;        // null = viewing; "new" or a skill id = editing
+
+const skLayerOf = s => s.space === "personal" ? "personal" : "company";
 
 async function loadSkillList() {
   try { skills = (await api.listSkills()) || []; } catch (e) { skills = []; showToast(e.message, true); }
@@ -53,70 +63,139 @@ async function loadSkillList() {
 }
 
 async function loadSkills() {
-  await loadSkillList();
-  if (skSelectedId && !skills.some(s => s.id === skSelectedId)) skSelectedId = null;
-  if (!skSelectedId && skills.length) skSelectedId = skills[0].id;
-  skEditing = null;
-  renderSkillList();
-  renderSkill();
+  await Promise.all([loadSkillList(), loadSkillPeople()]);
+  const open = skills.find(s => s.id === skSelectedId);
+  if (open) openSkillDrawer(open.id); else closeSkillDrawer();
+  renderSkillGrid();
 }
 
-function renderSkillList() {
-  const q = skel.search.value.trim().toLowerCase();
-  const shown = skills.filter(s => !q || [s.name, s.description, s.category].some(v => (v || "").toLowerCase().includes(q)));
-  skel.list.innerHTML = "";
-  if (!shown.length) {
-    skel.list.innerHTML = '<p class="kb-empty">' + L(skills.length ? "sk.noMatch" : "sk.empty") + "</p>";
-    return;
-  }
-  let layer = undefined, group = undefined;
-  shown.forEach(s => {
-    if (s.space !== layer) {
-      layer = s.space;
-      group = undefined;
-      const h = document.createElement("div");
-      h.className = "sk-layer";
-      const name = document.createElement("span");
-      name.className = "sk-layer__name";
-      name.textContent = skLayerLabel(s.space);
-      name.title = name.textContent;
-      h.appendChild(name);
-      if (!s.canWrite) {
-        const ro = document.createElement("span");
-        ro.className = "kb-readonly";
-        ro.textContent = L("sk.readOnly");
-        h.appendChild(ro);
-      }
-      skel.list.appendChild(h);
-    }
-    const cat = s.category || L("sk.uncategorized");
-    if (cat !== group) {
-      group = cat;
-      const h = document.createElement("div");
-      h.className = "sk-group";
-      h.textContent = cat;
-      skel.list.appendChild(h);
-    }
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "sk-item" + (s.id === skSelectedId ? " is-selected" : "") + (s.enabled ? "" : " is-off");
-    const name = document.createElement("span");
-    name.className = "sk-item__name";
-    name.textContent = s.name;
-    const desc = document.createElement("span");
-    desc.className = "sk-item__desc";
-    desc.textContent = s.description || "";
-    b.append(name, desc);
-    b.addEventListener("click", () => { skSelectedId = s.id; skEditing = null; renderSkillList(); renderSkill(); });
-    skel.list.appendChild(b);
-  });
+async function loadSkillPeople() {
+  try {
+    const people = (await fetch("/api/v1/directory/users").then(kbJson)) || [];
+    skPeople = Object.fromEntries(people.map(p => [p.username, p.displayName || p.username]));
+  } catch (e) { /* names fall back to usernames */ }
 }
-skel.search.addEventListener("input", renderSkillList);
+
+const skPerson = username => skPeople[username] || username || "—";
+
+/** The layer a new skill starts in: the one the source filter shows, else the user's own. */
+const skNewLayer = () => skel.source.value === "company" ? "company" : "personal";
+
+function renderSkillGrid() {
+  renderSkillOwners();
+  const q = skel.search.value.trim().toLowerCase();
+  const source = skel.source.value, owner = skel.owner.value, state = skel.state.value;
+  const shown = skills.filter(s =>
+    (!q || [s.name, s.description, s.category].some(v => (v || "").toLowerCase().includes(q)))
+    && (!source || skLayerOf(s) === source)
+    && (!owner || s.createdBy === owner)
+    && (!state || (state === "on") === s.enabled)
+    && (!skMineOnly || s.createdBy === currentUsername))
+    // Most recently updated first: what people are working on now.
+    .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  skel.mine.classList.toggle("is-active", skMineOnly);
+  skel.mine.setAttribute("aria-pressed", String(skMineOnly));
+  skel.grid.replaceChildren(...shown.map(skillCard));
+  const filtered = q || source || owner || state || skMineOnly;
+  skel.count.textContent = L("sk.count", { n: shown.length });
+  skel.count.hidden = !skills.length;
+  skel.empty.hidden = shown.length > 0;
+  skel.empty.textContent = L(filtered ? "sk.noMatch" : "sk.empty");
+}
+
+/** The owner filter lists whoever created a skill the user can see, keeping the current choice. */
+function renderSkillOwners() {
+  const current = skel.owner.value;
+  const owners = [...new Set(skills.map(s => s.createdBy).filter(Boolean))]
+    .sort((a, b) => skPerson(a).localeCompare(skPerson(b)));
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = L("sk.fOwnerAll");
+  skel.owner.replaceChildren(all, ...owners.map(u => {
+    const o = document.createElement("option");
+    o.value = u;
+    o.textContent = skPerson(u);
+    return o;
+  }));
+  skel.owner.value = owners.includes(current) ? current : "";
+}
+
+function skillCard(s) {
+  // A div, not a button: it holds the Edit / Delete buttons. Click or Enter opens the skill.
+  const card = document.createElement("div");
+  card.className = "sk-card" + (s.enabled ? "" : " is-off");
+  card.tabIndex = 0;
+  card.setAttribute("role", "button");
+  const head = document.createElement("div");
+  head.className = "sk-card__head";
+  const name = document.createElement("h3");
+  name.className = "sk-card__name";
+  name.textContent = s.name;
+  name.title = s.name;
+  head.appendChild(name);
+  if (s.canWrite) {
+    const actions = document.createElement("span");
+    actions.className = "sk-card__actions";
+    const act = (label, cls, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "link-btn " + cls;
+      b.textContent = L(label);
+      b.addEventListener("click", e => { e.stopPropagation(); fn(s); });
+      return b;
+    };
+    actions.append(act("sk.edit", "link-btn--muted", editSkill), act("common.delete", "link-btn--danger", confirmDeleteSkill));
+    head.appendChild(actions);
+  }
+  const tags = document.createElement("div");
+  tags.className = "sk-card__tags";
+  const tag = (text, cls) => {
+    const t = document.createElement("span");
+    t.className = "sk-tag" + (cls ? " " + cls : "");
+    t.textContent = text;
+    tags.appendChild(t);
+  };
+  tag(skLayerLabel(s.space));
+  if (s.category) tag(s.category);
+  tag(L(s.enabled ? "sk.stateOn" : "sk.stateOff"), s.enabled ? "is-on" : "is-off");
+  if (!s.canWrite) tag(L("sk.readOnly"), "is-muted");
+  const desc = document.createElement("p");
+  desc.className = "sk-card__desc";
+  desc.textContent = s.description || L("sk.noDescription");
+  desc.classList.toggle("is-empty", !s.description);
+  const foot = document.createElement("div");
+  foot.className = "sk-card__foot";
+  const when = document.createElement("span");
+  when.className = "sk-card__when";
+  when.textContent = L("sk.updatedOn", { date: skDate(s.updatedAt) });
+  when.title = formatDateTime(s.updatedAt);
+  const who = document.createElement("span");
+  who.className = "sk-card__who";
+  const face = document.createElement("span");
+  face.className = "sk-card__face";
+  paintAvatar(face, s.createdBy || "?", skPerson(s.createdBy));
+  const label = document.createElement("span");
+  label.textContent = skPerson(s.createdBy);
+  who.append(face, label);
+  foot.append(when, who);
+  card.append(head, tags, desc, foot);
+  card.addEventListener("click", () => openSkillDrawer(s.id));
+  card.addEventListener("keydown", e => { if (e.key === "Enter" && e.target === card) openSkillDrawer(s.id); });
+  return card;
+}
+
+/** 2026.10.28 — the date alone; the exact time is on hover. */
+function skDate(iso) {
+  const d = new Date(iso);
+  return d.getFullYear() + "." + String(d.getMonth() + 1).padStart(2, "0") + "." + String(d.getDate()).padStart(2, "0");
+}
+
+skel.search.addEventListener("input", renderSkillGrid);
+[skel.source, skel.owner, skel.state].forEach(x => x.addEventListener("change", renderSkillGrid));
+skel.mine.addEventListener("click", () => { skMineOnly = !skMineOnly; renderSkillGrid(); });
 
 function skLayerLabel(space) {
-  if (space === "personal") return L("sk.layerPersonal");
-  if (space === "company") return L("sk.layerCompany");
-  return (space || "").replace(/^team:/, "");
+  return L(space === "personal" ? "sk.layerPersonal" : "sk.layerCompany");
 }
 
 // Markdown references images as images/<name>; point those at the skill's image endpoint.
@@ -131,6 +210,23 @@ function renderSkillMarkdown(skill) {
   return div;
 }
 
+function openSkillDrawer(id) {
+  skSelectedId = id;
+  skEditing = null;
+  skel.drawer.hidden = false;
+  renderSkill();
+}
+
+function closeSkillDrawer() {
+  skel.drawer.hidden = true;
+  skSelectedId = null;
+  skEditing = null;
+}
+skel.drawer.querySelectorAll("[data-close]").forEach(x => x.addEventListener("click", closeSkillDrawer));
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !skel.drawer.hidden && document.getElementById("kbModal").hidden) closeSkillDrawer();
+});
+
 function renderSkill() {
   const skill = skills.find(s => s.id === skSelectedId);
   skel.form.hidden = !skEditing;
@@ -138,11 +234,7 @@ function renderSkill() {
   skel.actions.hidden = !!skEditing || !skill || !skill.canWrite;
   if (skEditing) return;
   skel.view.innerHTML = "";
-  if (!skill) {
-    skel.heading.textContent = L("sk.title");
-    skel.view.innerHTML = '<p class="kb-empty">' + L("sk.pick") + "</p>";
-    return;
-  }
+  if (!skill) { closeSkillDrawer(); return; }
   skel.heading.textContent = skill.name;
   const meta = document.createElement("p");
   meta.className = "sk-meta";
@@ -162,6 +254,8 @@ function renderSkill() {
 
 function openSkillForm(skill) {
   skEditing = skill ? skill.id : "new";
+  if (!skill) skSelectedId = null;
+  skel.drawer.hidden = false;
   skel.heading.textContent = skill ? L("sk.editTitle", { name: skill.name }) : L("sk.newTitle");
   skel.name.value = skill ? skill.name : "";
   skel.category.value = skill ? skill.category || "" : "";
@@ -177,13 +271,14 @@ function openSkillForm(skill) {
   });
   skel.imagesField.hidden = !skill; // images attach to a saved skill
   if (skill) renderSkillImages(skill);
-  renderSkillSpaces(skill ? skill.space : "personal");
+  renderSkillSpaces(skill ? skill.space : "personal", skill ? null : skNewLayer());
   renderSkill();
   skel.name.focus();
 }
 
-// The layers the user may put a skill in: their own, their teams, the company's (admins).
-async function renderSkillSpaces(current) {
+// The layers the user may put a skill in: their own, or the company's (admins). A new skill starts in
+// the open tab's layer when the user may write there.
+function renderSkillSpaces(current, preferLayer) {
   skel.space.innerHTML = "";
   const add = (id, label) => {
     const o = document.createElement("option");
@@ -191,14 +286,10 @@ async function renderSkillSpaces(current) {
     o.textContent = label;
     skel.space.appendChild(o);
   };
-  add(current, current === "personal" ? L("sk.spacePersonal") : skLayerLabel(current));
-  let spaces = [];
-  try { spaces = (await api.skillSpaces()) || []; } catch (e) { return; }
-  skel.space.innerHTML = "";
-  spaces.filter(sp => sp.canWrite || sp.id === current).forEach(sp => add(sp.id,
-    sp.kind === "personal" ? L("sk.spacePersonal")
-      : sp.kind === "company" ? L("sk.spaceCompany") : L("sk.spaceTeam", { team: sp.team })));
-  skel.space.value = current;
+  add("personal", L("sk.spacePersonal"));
+  if (isAdmin || current === "company") add("company", L("sk.spaceCompany"));
+  skel.space.value = !current || current === "personal" ? (preferLayer === "company" && isAdmin ? "company" : "personal")
+    : current;
 }
 
 function renderSkillImages(skill) {
@@ -224,7 +315,7 @@ function renderSkillImages(skill) {
     remove.type = "button";
     remove.className = "link-btn link-btn--danger";
     remove.textContent = "×";
-    remove.title = L("kb.delete");
+    remove.title = L("common.delete");
     remove.addEventListener("click", async () => {
       try { replaceSkill(await api.deleteSkillImage(skill.id, name)); renderSkillImages(skills.find(s => s.id === skill.id)); }
       catch (e) { showToast(e.message, true); }
@@ -265,11 +356,32 @@ skel.imageInput.addEventListener("change", async () => {
 });
 
 skel.newBtn.addEventListener("click", () => openSkillForm(null));
+/** Edit a skill straight from its card or from the drawer: the form opens in the drawer. */
+function editSkill(skill) {
+  skSelectedId = skill.id;
+  openSkillForm(skill);
+}
+
+function confirmDeleteSkill(skill) {
+  kbOpenModal({
+    title: L("sk.deleteTitle"), submit: L("common.delete"), danger: true,
+    message: L("sk.deleteConfirm", { name: skill.name }),
+    action: async () => {
+      await api.deleteSkill(skill.id);
+      if (skSelectedId === skill.id) closeSkillDrawer();
+      showToast(L("sk.deleted", { name: skill.name }), false);
+      await loadSkills();
+    },
+  });
+}
+
 skel.edit.addEventListener("click", () => {
   const skill = skills.find(s => s.id === skSelectedId);
-  if (skill) openSkillForm(skill);
+  if (skill) editSkill(skill);
 });
-skel.cancel.addEventListener("click", () => { skEditing = null; renderSkill(); });
+skel.cancel.addEventListener("click", () => {
+  if (skEditing === "new") closeSkillDrawer(); else { skEditing = null; renderSkill(); }
+});
 skel.form.addEventListener("submit", async e => {
   e.preventDefault();
   const body = {
@@ -289,12 +401,7 @@ skel.form.addEventListener("submit", async e => {
 });
 skel.del.addEventListener("click", () => {
   const skill = skills.find(s => s.id === skSelectedId);
-  if (!skill) return;
-  kbOpenModal({
-    title: L("sk.deleteTitle"), submit: L("kb.delete"), danger: true,
-    message: L("sk.deleteConfirm", { name: skill.name }),
-    action: async () => { await api.deleteSkill(skill.id); skSelectedId = null; await loadSkills(); },
-  });
+  if (skill) confirmDeleteSkill(skill);
 });
 
 // Agent form: a multi-select dropdown of skills (enabled ones; a disabled one already attached stays listed).
