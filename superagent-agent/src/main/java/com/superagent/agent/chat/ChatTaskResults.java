@@ -34,20 +34,11 @@ public class ChatTaskResults {
     public static final String AUTHOR_PREFIX = "task:";
 
     /** Joins an agent's system prompt when it has the task tools. */
-    static final String GUIDE = """
-            ## 做事放进任务
-            你的对话用来聊和安排：回答问题、讨论、理清和拆分要做的事、查进展、很短的小活。真正干活的事都放进任务里异步执行，对话不被占住，任务里也留下完整记录。
-            - 要读文件或资料、要产出一份东西（文档、PPT、代码、skill……）、要多步操作或要花上几分钟的：用 create_task 开任务，由你自己执行（带着你的人设、记忆和技能）。任务说明写全：目标、资料（用户给的路径原样写上；Files 里的文件写 id）、交付标准。开完用一两句话告诉用户任务名和要做什么，这一轮就结束，不要在对话里接着做，也不要先做一部分。
-            - 几句话就能完成的（回答、讨论、改一句话、起个标题、翻译一小段）：直接在对话里做。
-            - 需求不清楚就先问清楚再开任务；拿不准要不要开任务时，开任务。
-            - 任务完成、失败或需要确认时，结果会自动发到这个对话里（标着「任务」），用户可能接着它说。
-            """;
+    static final String GUIDE = TaskConfirmPrompt.rules("create_task", "")
+            + "任务由你自己执行（带着你的人设、记忆和技能）。完成、失败或需要确认时，结果会自动发到这个对话里（标着「任务通知」），用户可能接着它说。\n";
 
     /** Put right before every user message, next to the request: the system prompt alone loses to the wording. */
-    static final String TURN_CHECK = """
-            ## 回复前先判断（每条消息都要）
-            这件事需要读文件或资料、产出一份东西、多步操作或花上几分钟吗？需要就用 create_task 开任务、回一两句就结束；不需要就直接回复。拿不准时开任务。
-            """;
+    static final String TURN_CHECK = TaskConfirmPrompt.turnCheck("create_task");
 
     private static final Logger log = LoggerFactory.getLogger(ChatTaskResults.class);
     private static final int RESULT_CHARS = 1500;

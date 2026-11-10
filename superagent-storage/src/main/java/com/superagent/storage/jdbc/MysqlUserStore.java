@@ -5,12 +5,13 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.List;
 
-/** MySQL user store: upsert via {@code ON DUPLICATE KEY UPDATE}, hard delete. */
+/** MySQL user store: update-or-insert, hard delete. */
 public class MysqlUserStore extends AbstractJdbcUserStore {
 
     private static final List<String> SCHEMA = List.of(
             """
             CREATE TABLE IF NOT EXISTS app_user (
+              company_id    VARCHAR(64)  NOT NULL,
               id            VARCHAR(64)  NOT NULL,
               username      VARCHAR(190) NOT NULL,
               display_name  VARCHAR(255),
@@ -22,10 +23,11 @@ public class MysqlUserStore extends AbstractJdbcUserStore {
               source        VARCHAR(16)  NOT NULL,
               created_at    DATETIME(3)  NOT NULL,
               updated_at    DATETIME(3)  NOT NULL,
-              PRIMARY KEY (id),
-              UNIQUE KEY uq_user_username (username),
-              KEY idx_user_phone (phone),
-              KEY idx_user_external (external_id)
+              must_change_password TINYINT(1) NOT NULL DEFAULT 0,
+              PRIMARY KEY (company_id, id),
+              UNIQUE KEY uq_user_username (company_id, username),
+              KEY idx_user_phone (company_id, phone),
+              KEY idx_user_external (company_id, external_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """);
 
@@ -38,19 +40,23 @@ public class MysqlUserStore extends AbstractJdbcUserStore {
         return "";
     }
 
+    // Update by (company, id), else insert: a username taken in the company then fails on the unique key instead of
+    // overwriting that other user.
     @Override
     public User save(User u) {
-        jdbc.update("INSERT INTO app_user " + COLUMNS + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                        + "ON DUPLICATE KEY UPDATE username=VALUES(username), display_name=VALUES(display_name), "
-                        + "roles=VALUES(roles), enabled=VALUES(enabled), password_hash=VALUES(password_hash), "
-                        + "phone=VALUES(phone), external_id=VALUES(external_id), source=VALUES(source), "
-                        + "updated_at=VALUES(updated_at)",
-                params(u));
+        int updated = jdbc.update("UPDATE app_user SET username = ?, display_name = ?, roles = ?, enabled = ?, "
+                        + "password_hash = ?, phone = ?, external_id = ?, source = ?, updated_at = ?, must_change_password = ? "
+                        + "WHERE company_id = ? AND id = ?",
+                u.username(), nn(u.displayName()), String.join(",", u.roles()), u.enabled(), nn(u.passwordHash()),
+                nn(u.phone()), nn(u.externalId()), u.source().name(), utc(u.updatedAt()), u.mustChangePassword(), TenantSchema.company(), u.id());
+        if (updated == 0) {
+            insert(u);
+        }
         return u;
     }
 
     @Override
     public void delete(String id) {
-        jdbc.update("DELETE FROM app_user WHERE id = ?", id);
+        jdbc.update("DELETE FROM app_user WHERE company_id = ? AND id = ?", TenantSchema.company(), id);
     }
 }

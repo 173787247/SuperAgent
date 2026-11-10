@@ -27,6 +27,7 @@ public final class ApiPaths {
 
     /** Work files: what agents produced (documents, images, videos). */
     public static final String FILES = V1 + "/files";
+    public static final String PROJECTS = V1 + "/projects";
     public static final String FILE_FOLDERS = FILES + "/folders";
 
     /** Saved prompts that run as tasks by schedule or API call. */
@@ -35,6 +36,9 @@ public final class ApiPaths {
     public static final String AUTH = V1 + "/auth";
     /** The signed-in user's own account (avatar, password). */
     public static final String ACCOUNT = V1 + "/account";
+
+    /** Registering an organization (open to anyone, before signing in). */
+    public static final String ORGS = V1 + "/orgs";
     /** Anyone's avatar, for any signed-in user. */
     public static final String AVATARS = V1 + "/avatars";
 

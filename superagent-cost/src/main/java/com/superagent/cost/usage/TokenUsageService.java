@@ -39,6 +39,8 @@ public class TokenUsageService implements UsageRecorder {
     private static final Logger log = LoggerFactory.getLogger(TokenUsageService.class);
     /** Without a listed cache price: what the main vendors charge relative to input (reads ~10%, writes 1.25×, 1h 2×). */
     private static final double CACHE_READ = 0.1;
+    /** The background's own checks are booked to this "user" (see ProviderInferenceProbe). */
+    private static final String SYSTEM = com.superagent.platform.provider.ProviderInferenceProbe.SYSTEM_USER;
     private static final double CACHE_WRITE = 1.25;
     private static final double CACHE_WRITE_1H = 2.0;
 
@@ -50,6 +52,22 @@ public class TokenUsageService implements UsageRecorder {
             .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     private final com.superagent.core.task.TaskStore tasks;
+    private com.superagent.core.task.TaskLinkStore links; // null in tests: no subtasks
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setLinks(com.superagent.core.task.TaskLinkStore links) {
+        this.links = links;
+    }
+
+    /** The task a run counts toward: a subtask's runs count toward its complex task. */
+    private java.util.function.UnaryOperator<String> rootTask() {
+        if (links == null) {
+            return id -> id;
+        }
+        Map<String, String> parent = new java.util.HashMap<>();
+        links.all().stream().filter(l -> l.parentId() != null).forEach(l -> parent.put(l.taskId(), l.parentId()));
+        return id -> id == null ? null : parent.getOrDefault(id, id);
+    }
 
     public TokenUsageService(UsageStore store, ModelPriceService prices, AgentStore agents, UserStore users,
                              com.superagent.core.task.TaskStore tasks) {
@@ -106,33 +124,45 @@ public class TokenUsageService implements UsageRecorder {
     // --- reading ---
 
     public UsageDtos.Task forTask(String taskId) {
-        List<UsageRecord> records = store.forTask(taskId);
+        // A complex task's cost is its own runs plus every subtask's.
+        List<String> kids = links == null ? List.of() : links.children(taskId);
+        List<UsageRecord> records = new java.util.ArrayList<>(store.forTask(taskId));
+        kids.forEach(k -> records.addAll(store.forTask(k)));
+        records.sort(Comparator.comparing(UsageRecord::at));
         Map<String, String> agentNames = agentNames();
+        List<UsageDtos.Total> byTask = kids.isEmpty() ? List.of() : group(records, UsageRecord::taskId,
+                id -> id.equals(taskId) ? "" : tasks.findTask(id).map(com.superagent.core.task.Task::title).orElse(id));
         return new UsageDtos.Task(records.stream().map(r -> row(r, agentNames)).toList(),
-                group(records, UsageRecord::model, m -> m), total(records));
+                group(records, UsageRecord::model, m -> m), total(records), byTask);
     }
 
     /** Usage from {@code from} to {@code to}: {@code user}'s own, or everyone's (null) with a breakdown by person. */
     public UsageDtos.Summary summary(String user, Instant from, Instant to, ZoneId zone) {
         List<UsageRecord> records = store.between(user, from, to);
         Map<String, String> agentNames = agentNames();
-        Map<String, String> people = new java.util.HashMap<>();
+        Map<String, String> names = new java.util.HashMap<>();
         if (user == null) {
-            users.listUsers().forEach(u -> people.put(u.username(), u.displayName() == null ? u.username() : u.displayName()));
+            users.listUsers().forEach(u -> names.put(u.id(), u.displayName() == null ? u.username() : u.displayName()));
         }
         List<UsageDtos.Total> byDay = group(records, r -> LocalDate.ofInstant(r.at(), zone).toString(), d -> d);
         byDay = byDay.stream().sorted(Comparator.comparing(UsageDtos.Total::key)).toList();
-        // Two kinds: a task's runs (its own and choosing its model), and everything else, by agent.
-        List<UsageRecord> forTasks = records.stream().filter(r -> r.taskId() != null).toList();
-        List<UsageRecord> forAgents = records.stream().filter(r -> r.taskId() == null).toList();
+        // Two kinds: a task's runs (its own and choosing its model), and everything else, by agent; and apart from
+        // both, the system's own background checks, which are nobody's.
+        List<UsageRecord> forSystem = records.stream().filter(r -> SYSTEM.equals(r.user())).toList();
+        List<UsageRecord> people = records.stream().filter(r -> !SYSTEM.equals(r.user())).toList();
+        List<UsageRecord> forTasks = people.stream().filter(r -> r.taskId() != null).toList();
+        List<UsageRecord> forAgents = people.stream().filter(r -> r.taskId() == null).toList();
         Map<String, String> titles = new java.util.HashMap<>();
         forTasks.forEach(r -> titles.computeIfAbsent(r.taskId(), id -> tasks.findTask(id).map(com.superagent.core.task.Task::title).orElse(null)));
-        List<UsageDtos.Total> byTask = group(forTasks, UsageRecord::taskId, id -> titles.get(id) == null ? "" : titles.get(id));
+        java.util.function.UnaryOperator<String> root = rootTask(); // a subtask's runs show under its complex task
+        forTasks.forEach(r -> titles.computeIfAbsent(root.apply(r.taskId()), id -> tasks.findTask(id).map(com.superagent.core.task.Task::title).orElse(null)));
+        List<UsageDtos.Total> byTask = group(forTasks, r -> root.apply(r.taskId()), id -> titles.get(id) == null ? "" : titles.get(id));
         List<UsageDtos.Total> byAgent = group(forAgents, r -> r.agentId() == null ? "" : r.agentId(),
                 a -> a.isEmpty() ? "" : agentNames.getOrDefault(a, ""));
         return new UsageDtos.Summary(from, to, total(records), total(forTasks), total(forAgents), byDay,
                 latestFirst(byTask), byAgent, group(records, UsageRecord::model, m -> m),
-                user == null ? group(records, r -> r.user() == null ? "" : r.user(), u -> people.getOrDefault(u, u)) : List.of());
+                user == null ? group(people, r -> r.user() == null ? "" : r.user(), u -> names.getOrDefault(u, u)) : List.of(),
+                total(forSystem), group(forSystem, r -> r.source() + "|" + r.model(), k -> k));
     }
 
     private static List<UsageDtos.Total> latestFirst(List<UsageDtos.Total> rows) {
@@ -150,7 +180,7 @@ public class TokenUsageService implements UsageRecorder {
     private static UsageDtos.Row row(UsageRecord r, Map<String, String> agentNames) {
         return new UsageDtos.Row(r.at(), r.source(), r.user(), r.agentId(),
                 r.agentId() == null ? null : agentNames.get(r.agentId()), r.cli(), r.model(), r.input(), r.cacheRead(),
-                r.cacheWrite(), r.output(), r.reasoning(), r.total(), r.costUsd(), r.cliCostUsd());
+                r.cacheWrite(), r.output(), r.reasoning(), r.total(), r.costUsd(), r.cliCostUsd(), r.taskId());
     }
 
     /** Totals per key, the most tokens first. */

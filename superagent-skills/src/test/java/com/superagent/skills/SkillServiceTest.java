@@ -5,9 +5,12 @@ import com.superagent.api.skill.SkillRequest;
 import com.superagent.core.settings.SystemSettingStore;
 import com.superagent.core.skill.Skill;
 import com.superagent.core.skill.SkillStore;
+import com.superagent.core.tenant.TenantContext;
 import com.superagent.core.user.User;
 import com.superagent.core.user.UserSource;
 import com.superagent.core.user.UserStore;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -46,12 +49,22 @@ class SkillServiceTest {
     @TempDir
     Path tmp;
 
+    @BeforeEach
+    void company() {
+        TenantContext.set("acme");
+    }
+
+    @AfterEach
+    void clear() {
+        TenantContext.clear();
+    }
+
     private static final byte[] PNG = {(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0};
 
     /** Everyone exists; only "root" is an administrator. */
     private static final class Users implements UserStore {
         @Override public List<User> listUsers() { return List.of(); }
-        @Override public Optional<User> findById(String id) { return Optional.empty(); }
+        @Override public Optional<User> findById(String id) { return findByUsername(id); }
         @Override public Optional<User> findByUsername(String name) {
             Instant now = Instant.now();
             return Optional.of(new User(name, name, name, "root".equals(name) ? Set.of("ADMIN") : Set.of("USER"), true,
@@ -64,7 +77,9 @@ class SkillServiceTest {
     }
 
     private SkillService service(InMemorySkills store, InMemorySettings settings, Path dir) {
-        return new SkillService(store, settings, new Users(), dir.toString(), "admin");
+        SkillService svc = new SkillService(store, settings, new Users(), dir.toString());
+        svc.seedOnce(); // what each company's start does
+        return svc;
     }
 
     private static SkillRequest req(String name, String space) {
@@ -89,7 +104,7 @@ class SkillServiceTest {
         // Someone who couldn't delete it can't even get a card for it; the built-in administrator (from the
         // configuration, not the user table) can, like any administrator.
         assertThatThrownBy(() -> deletions.propose(company, "ada", "a1", "s1", "m1")).isInstanceOf(SkillForbiddenException.class);
-        assertThat(svc.get(company, "admin").canWrite()).isTrue();
+        assertThat(svc.get(company, "root").canWrite()).isTrue();
 
         var proposed = deletions.propose(mine, "ada", "a1", "s1", "m1");
         assertThat(svc.list("ada")).anyMatch(x -> x.id().equals(mine)); // nothing deleted yet
@@ -122,7 +137,7 @@ class SkillServiceTest {
     }
 
     @Test
-    void personalSkillsAreTheOwnersAndTeamSkillsAreRetired() {
+    void personalSkillsAreTheOwnersAndTeamSkillsAreGone() {
         InMemorySkills store = new InMemorySkills();
         InMemorySettings settings = new InMemorySettings();
         SkillService svc = service(store, settings, tmp.resolve("skills"));
@@ -141,12 +156,6 @@ class SkillServiceTest {
         svc.setAgentSkills("agent-b", List.of(mine, company), "bob");
         assertThat(svc.forAgent("agent-b", "bob")).extracting(Skill::id).containsExactly(mine, company);
 
-        // A team skill from before becomes its creator's own on the next start.
-        Instant now = Instant.now();
-        store.save(new Skill("00000000-0000-0000-0000-000000000001", "接口", null, null, "x", "team:技术中心", true,
-                false, "dan", "dan", now, now));
-        service(store, settings, tmp.resolve("skills"));
-        assertThat(store.rows.get("00000000-0000-0000-0000-000000000001").space()).isEqualTo("personal:dan");
     }
 
     @Test

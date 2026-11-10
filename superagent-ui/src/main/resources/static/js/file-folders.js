@@ -17,6 +17,8 @@ Object.assign(api, {
 
 const FF_ALL = "*";       // every file
 const FF_UNFILED = "";    // files in no folder
+const FF_AGENT = "agent:"; // + an agent id: every file that agent made or was given, a folder of its own nobody keeps up
+const ffAgentId = id => typeof id === "string" && id.startsWith(FF_AGENT) ? id.slice(FF_AGENT.length) : null;
 const FF_MAX_DEPTH = 3;
 const ffEl = {
   tree: document.getElementById("ffTree"),
@@ -29,7 +31,7 @@ const ffCollapsed = new Set();
 
 async function ffLoad() {
   try { ffFolders = (await api.ffList()) || []; } catch (e) { ffFolders = []; showToast(e.message, true); }
-  if (ffChosen !== FF_ALL && ffChosen !== FF_UNFILED && !ffFolders.some(f => f.id === ffChosen)) ffChosen = FF_ALL;
+  if (ffChosen !== FF_ALL && ffChosen !== FF_UNFILED && !ffAgentId(ffChosen) && !ffFolders.some(f => f.id === ffChosen)) ffChosen = FF_ALL;
 }
 
 // A folder and everything under it.
@@ -41,6 +43,7 @@ function ffSubtree(id) {
 
 function ffInScope(file) {
   if (ffChosen === FF_ALL) return true;
+  if (ffAgentId(ffChosen)) return file.agentId === ffAgentId(ffChosen);
   if (ffChosen === FF_UNFILED) return !file.folderId;
   return ffSubtree(ffChosen).has(file.folderId);
 }
@@ -48,20 +51,22 @@ function ffInScope(file) {
 function ffRenderTree() {
   const count = id => {
     if (id === FF_ALL) return files.length;
+    if (ffAgentId(id)) return files.filter(f => f.agentId === ffAgentId(id)).length;
     if (id === FF_UNFILED) return files.filter(f => !f.folderId).length;
     const inside = ffSubtree(id);
     return files.filter(f => inside.has(f.folderId)).length;
   };
   const row = (id, name, depth, folder) => {
     const item = document.createElement("div");
-    item.className = "ff-node" + (ffChosen === id ? " is-chosen" : "");
+    const kind = id === FF_ALL ? "all" : id === FF_UNFILED ? "unfiled" : ffAgentId(id) ? "agent" : "folder";
+    item.className = "ff-node ff-node--" + kind + (ffChosen === id ? " is-chosen" : "") + (depth > 0 ? " is-nested" : "");
     item.style.setProperty("--ff-depth", depth);
     item.setAttribute("role", "treeitem");
     const hasKids = folder && ffFolders.some(f => f.parentId === folder.id);
     const caret = document.createElement("button");
     caret.type = "button";
-    caret.className = "ff-node__caret";
-    caret.textContent = hasKids ? (ffCollapsed.has(id) ? "▸" : "▾") : "";
+    caret.className = "ff-node__caret" + (hasKids ? " has-kids" + (ffCollapsed.has(id) ? "" : " is-open") : "");
+    caret.setAttribute("aria-label", hasKids ? L(ffCollapsed.has(id) ? "ff.expand" : "ff.collapse") : "");
     caret.tabIndex = hasKids ? 0 : -1;
     caret.addEventListener("click", e => {
       e.stopPropagation();
@@ -78,17 +83,39 @@ function ffRenderTree() {
     const n = document.createElement("span");
     n.className = "ff-node__count";
     n.textContent = count(id) || "";
-    item.append(caret, label, n);
+    const icon = document.createElement("span");
+    icon.className = "ff-node__icon";
+    icon.setAttribute("aria-hidden", "true");
+    if (kind === "agent") icon.textContent = (files.find(f => f.agentId === ffAgentId(id)) || {}).agentAvatar || "🙂";
+    item.append(caret, icon, label, n);
     if (folder) item.appendChild(ffActions(folder, depth));
-    if (id !== FF_ALL) ffMakeDropTarget(item, id);
+    if (id !== FF_ALL && kind !== "agent") ffMakeDropTarget(item, id); // an agent's folder follows its files, not drops
     return item;
   };
-  const nodes = [row(FF_ALL, L("ff.all"), 0), row(FF_UNFILED, L("ff.unfiled"), 0)];
+  const nodes = [row(FF_ALL, L("ff.all"), 0), row(FF_UNFILED, L("ff.unfiled"), 0), document.createElement("div")];
+  nodes[2].className = "ff-sep";
+  if (!ffFolders.length) {
+    const hint = document.createElement("p");
+    hint.className = "ff-hint";
+    hint.textContent = L("ff.noFolders");
+    nodes.push(hint);
+  }
   const walk = (parentId, depth) => ffFolders.filter(f => (f.parentId || null) === parentId).forEach(f => {
     nodes.push(row(f.id, f.name, depth, f));
     if (!ffCollapsed.has(f.id)) walk(f.id, depth + 1);
   });
   walk(null, 0);
+  // One folder per agent, made from the files themselves: everything an agent saved or was handed, kept together.
+  const byAgent = new Map();
+  files.filter(f => f.agentId).forEach(f => { if (!byAgent.has(f.agentId)) byAgent.set(f.agentId, f.agentName || f.agentId); });
+  if (byAgent.size) {
+    const head = document.createElement("div");
+    head.className = "ff-section";
+    head.textContent = L("ff.agents");
+    head.title = L("ff.agentsHint");
+    nodes.push(head);
+    [...byAgent].sort((a, b) => a[1].localeCompare(b[1])).forEach(([id, name]) => nodes.push(row(FF_AGENT + id, name, 0)));
+  }
   ffEl.tree.replaceChildren(...nodes);
 }
 

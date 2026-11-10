@@ -11,6 +11,7 @@ SuperAgent iterates fast. This is what isn't built yet, so the rest of the docs 
 
 - **Handover when someone leaves** — move a person's agents, their context and their files to a successor, who carries on from there.
 - **Company-wide folders** — shared folders beyond each person's own.
+- **Projects, further** — spend per project on the analytics page, and your SuperAgent setting up a project as part of a plan.
 
 ## Knowledge
 
@@ -18,12 +19,13 @@ SuperAgent iterates fast. This is what isn't built yet, so the rest of the docs 
 
 ## Cost
 
-- **Routing by task difficulty** — pick the tier for each piece of work automatically. Today, people choose the tier ([model tiers](./models#model-tiers-preview) are a preview, off by default).
+- **A model gateway** — every model call goes through one place in SuperAgent, so keys never reach the agents, usage is metered in one place, and a company's own model gateway can sit behind it.
 
 ## Governance and security
 
 - **Enterprise approval workflows** — connect key actions to the company's approval process.
-- **Isolation** — run what agents execute in an isolated environment.
+- **Isolation** — run each employee's agents in their own sandbox (microVM, gVisor or Docker), with outbound traffic through a proxy and no long-lived secrets inside.
+- **Many machines and many companies** — Workers on several machines with scheduling in the control plane, and one control plane serving many companies. See [Architecture](./architecture).
 
 ## Sign-in and organization
 

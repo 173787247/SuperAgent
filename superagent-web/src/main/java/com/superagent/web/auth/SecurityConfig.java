@@ -1,6 +1,7 @@
 package com.superagent.web.auth;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.superagent.platform.user.AccountService;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -15,8 +16,10 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.intercept.AuthorizationFilter;
 import org.springframework.security.web.authentication.AuthenticationFailureHandler;
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
 import java.io.IOException;
 import java.util.Map;
@@ -45,8 +48,11 @@ public class SecurityConfig {
     }
 
     @Bean
-    SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    SecurityFilterChain filterChain(HttpSecurity http, AccountService account) throws Exception {
         http
+                .addFilterBefore(new OrgLoginFilter(), UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(new TenantFilter(), AuthorizationFilter.class)
+                .addFilterAfter(new PasswordChangeFilter(account), TenantFilter.class)
                 .csrf(csrf -> csrf.disable())
                 // The Files drawer shows a PDF in a frame of this same site; other sites still can't frame any page.
                 .headers(h -> h.frameOptions(f -> f.sameOrigin()))
@@ -55,6 +61,9 @@ public class SecurityConfig {
                                 "/i18n.js", "/superagent-logo.png", "/favicon.ico").permitAll()
                         .requestMatchers("/api/v1/meta", "/actuator/health", "/api/v1/branding/logo").permitAll()
                         .requestMatchers("/api/v1/auth/login", "/api/v1/auth/phone/**").permitAll()
+                        // Anyone may register an organization, where the server allows it.
+                        .requestMatchers(HttpMethod.POST, "/api/v1/orgs").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/orgs/registration").permitAll()
                         .requestMatchers("/oauth2/**", "/login/oauth2/**", "/api/v1/auth/wechat/**").permitAll()
                         .requestMatchers("/mcp").permitAll() // gated by X-MCP-Token in McpController
                         // External callers: gated by the automation's own X-Automation-Token in AutomationService.
@@ -64,7 +73,7 @@ public class SecurityConfig {
                         .requestMatchers("/api/v1/providers/**").hasRole("ADMIN") // runs install commands on the host
                         // Everyone sees the connectors and manages their own authorization (a personal token,
                         // an OAuth handshake, a Feishu bind code); adding, editing and removing stay with admins.
-                        .requestMatchers(HttpMethod.GET, "/api/v1/connectors").authenticated()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/connectors", "/api/v1/connectors/*/tools").authenticated()
                         .requestMatchers("/api/v1/connectors/*/token", "/api/v1/connectors/*/bind-code",
                                 "/api/v1/oauth/**").authenticated()
                         .requestMatchers("/api/v1/connectors/**").hasRole("ADMIN")
@@ -85,14 +94,15 @@ public class SecurityConfig {
 
     private AuthenticationSuccessHandler successHandler() {
         return (request, response, authentication) -> writeJson(response, HttpStatus.OK, Map.of(
-                "username", authentication.getName(),
+                "userId", authentication.getName(),
+                "username", authentication.getPrincipal() instanceof TenantUser u ? u.loginName() : authentication.getName(),
                 "roles", roles(authentication)));
     }
 
     private AuthenticationFailureHandler failureHandler() {
         return (request, response, exception) ->
                 writeJson(response, HttpStatus.UNAUTHORIZED, Map.of("code", "unauthorized",
-                        "message", "用户名或密码错误，或账号未授权"));
+                        "message", "组织、用户名或密码错误，或账号未授权"));
     }
 
     /** API calls get 401; page loads are redirected to the login page. */

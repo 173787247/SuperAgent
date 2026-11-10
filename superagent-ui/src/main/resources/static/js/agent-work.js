@@ -16,7 +16,7 @@ const awel = {
 };
 
 // Tasks still under way come first (what needs watching), then the rest; newest first within each.
-const ACTIVE_TASK = new Set(["pending", "running", "needs_confirmation"]);
+const ACTIVE_TASK = new Set(["pending", "running", "needs_confirmation", "waiting"]);
 
 async function renderAgentWork(agent) {
   awel.wrap.hidden = !agent || agent.kind === "super";
@@ -28,9 +28,18 @@ async function renderAgentWork(agent) {
   if (activeAgent !== agent) return; // switched agents while loading
   noticeSettledTasks(agent, items || []);
   attachAgentTaskCards(items || []);
-  items = (items || []).slice().sort((a, b) => ACTIVE_TASK.has(b.status) - ACTIVE_TASK.has(a.status));
-  awel.list.replaceChildren(...items.map(agentWorkRow));
-  awel.empty.hidden = items.length > 0;
+  // A complex task's subtasks sit under it, folded away; the list holds the work the agent set off.
+  const all = items || [];
+  const ids = new Set(all.map(t => t.id));
+  const kids = new Map();
+  all.filter(t => t.parentId && ids.has(t.parentId)).forEach(t => {
+    if (!kids.has(t.parentId)) kids.set(t.parentId, []);
+    kids.get(t.parentId).push(t);
+  });
+  const top = all.filter(t => !(t.parentId && ids.has(t.parentId)))
+    .sort((a, b) => ACTIVE_TASK.has(b.status) - ACTIVE_TASK.has(a.status));
+  awel.list.replaceChildren(...top.map(t => agentWorkItem(t, kids.get(t.id) || [])));
+  awel.empty.hidden = top.length > 0;
   made = made || [];
   awel.files.replaceChildren(...made.map(agentFileRow));
   awel.filesEmpty.hidden = made.length > 0;
@@ -54,7 +63,7 @@ function agentFileRow(f) {
   meta.className = "sw-meta";
   const who = document.createElement("span");
   who.className = "sw-who";
-  who.textContent = f.taskTitle ? L("fl.fromTask", { title: f.taskTitle }) : (f.ownerName || f.owner || "");
+  who.textContent = f.taskTitle ? L("fl.fromTask", { title: f.taskTitle }) : (f.ownerName || personName(f.owner));
   const when = document.createElement("span");
   when.className = "sw-when";
   when.textContent = relativeTime(f.updatedAt);
@@ -63,6 +72,39 @@ function agentFileRow(f) {
   btn.append(icon, body);
   btn.addEventListener("click", () => openFile(f));
   li.appendChild(btn);
+  return li;
+}
+
+// Complex tasks whose subtasks the user unfolded; kept across the panel's refreshes.
+const agentWorkOpen = new Set();
+
+/** A task, and under a complex one its subtasks: folded by default, with how many there are. */
+function agentWorkItem(t, subs) {
+  const li = agentWorkRow(t);
+  const n = Math.max(subs.length, t.subtasks || 0);
+  if (!n) return li;
+  const done = subs.length ? subs.filter(s => !ACTIVE_TASK.has(s.status)).length : (t.subtasksFinished || 0);
+  li.classList.add("sw-parent");
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "sw-toggle";
+  const open = agentWorkOpen.has(t.id);
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.textContent = L("aw.subtasks", { done, n });
+  toggle.title = L(open ? "aw.subtasksHide" : "aw.subtasksShow");
+  const list = document.createElement("ul");
+  list.className = "sw-sub";
+  list.hidden = !open;
+  subs.slice().sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .forEach(s => list.appendChild(agentWorkRow(s)));
+  toggle.addEventListener("click", () => {
+    const now = !agentWorkOpen.has(t.id);
+    if (now) agentWorkOpen.add(t.id); else agentWorkOpen.delete(t.id);
+    list.hidden = !now;
+    toggle.setAttribute("aria-expanded", String(now));
+    toggle.title = L(now ? "aw.subtasksHide" : "aw.subtasksShow");
+  });
+  li.append(toggle, list);
   return li;
 }
 
@@ -133,6 +175,11 @@ function attachAgentTaskCards(items) {
 function noticeSettledTasks(agent, items) {
   const before = agentTaskStatus.agentId === agent.id ? agentTaskStatus.byId : null;
   agentTaskStatus = { agentId: agent.id, byId: new Map(items.map(t => [t.id, t.status])), items };
+  // Notes drawn before the statuses arrived get their colour now.
+  el.messages.querySelectorAll(".msg--task-report").forEach(m => {
+    const s = agentTaskStatus.byId.get(m.dataset.taskId);
+    if (s) m.className = m.className.replace(/\bis-\S*/g, "").trim() + " is-" + s;
+  });
   if (!before || streaming || liveWatch) return;
   // Moved since the last look — or new and already settled (it ran between two looks) — or handed to this agent
   // from elsewhere (the SuperAgent), with a note in this chat the page hasn't shown yet.
@@ -145,11 +192,14 @@ function noticeSettledTasks(agent, items) {
 
 /** A note from a task in the chat (taken on, finished, failed, waiting): labelled as such, with a way to open it. */
 function markTaskReport(msgEl, taskId) {
-  msgEl.classList.add("msg--background", "msg--task-report");
+  // Coloured by how the task stands now (done / failed / waiting on someone).
+  const status = agentTaskStatus.byId.get(taskId) || "";
+  msgEl.classList.add("msg--background", "msg--task-report", "is-" + status);
+  msgEl.dataset.taskId = taskId;
   const tag = document.createElement("button");
   tag.type = "button";
   tag.className = "msg__bg-tag msg__task-tag";
-  tag.textContent = L("chat.taskReportTag");
+  tag.textContent = L("chat.taskReportTag") + " · " + L("chat.taskReportOpen");
   tag.title = L("super.dispatchOpenTask");
   tag.addEventListener("click", () => { setView("tasks"); openTask(taskId); });
   msgEl.prepend(tag);

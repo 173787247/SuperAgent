@@ -21,6 +21,7 @@ function renderStoredMessage(role, content, id, images, sessionId) {
   setBubbleContent(bubble, role, content);
   bubble.hidden = !content && !!(images && images.length); // image-only message: no empty bubble
   msg.appendChild(bubble);
+  if (role !== "user" && content) msg.appendChild(copyButton(bubble));
   if (id) {
     const edit = document.createElement("button");
     edit.className = "msg__edit";
@@ -31,6 +32,33 @@ function renderStoredMessage(role, content, id, images, sessionId) {
   }
   el.messages.appendChild(msg);
   return msg;
+}
+
+/** Copies a reply's text as written (its markdown), under the reply. */
+function copyButton(bubble) {
+  const row = document.createElement("div");
+  row.className = "msg__actions";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "msg__copy";
+  btn.textContent = L("chat.copy");
+  btn.addEventListener("click", async () => {
+    const text = bubble.dataset.md != null ? bubble.dataset.md : bubble.textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) { // no clipboard permission (e.g. plain http on another host): the old way
+      const ta = Object.assign(document.createElement("textarea"), { value: text });
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    btn.textContent = L("chat.copied");
+    btn.classList.add("is-done");
+    setTimeout(() => { btn.textContent = L("chat.copy"); btn.classList.remove("is-done"); }, 1500);
+  });
+  row.appendChild(btn);
+  return row;
 }
 
 // Messages a data source received, handed to the SuperAgent: one line, the messages folded away.
@@ -121,6 +149,7 @@ function addAssistantBubble() {
   tools.hidden = true;
   const text = document.createElement("div");
   text.className = "text is-streaming";
+  text.dataset.waiting = L("chat.waiting");
   bubble.append(thinking, tools, text);
   msg.appendChild(bubble);
   el.messages.appendChild(msg);
@@ -132,7 +161,7 @@ function addAssistantBubble() {
 // Phase 1 is 1 agent : 1 session; each agent carries its owning sessionId, which
 // is what we actually open to chat. The agent is the named role; the session is plumbing.
 async function loadAgents(autoOpen) {
-  const res = await api.listAgents();
+  const [res] = await Promise.all([api.listAgents(), refreshProjects()]); // projects group the sidebar
   agents = res.data || [];
   renderThreads(agents);
   if (autoOpen && !activeAgentId) {
@@ -148,9 +177,21 @@ const isOwner = a => !a || a.role !== "collaborator";
 function renderThreads(list) {
   el.threadList.innerHTML = "";
   const supers = list.filter(a => a.kind === "super");
-  const mine = list.filter(a => a.kind !== "super" && !isShared(a));
-  const shared = list.filter(a => a.kind !== "super" && isShared(a));
+  // An agent in a project is listed under it (whoever owns it); the rest are mine or shared.
+  const loose = list.filter(a => a.kind !== "super" && !projectOfAgentId(a.id));
+  const mine = loose.filter(a => !isShared(a));
+  const shared = loose.filter(a => isShared(a));
   supers.forEach(a => el.threadList.append(superThread(a), threadSeparator()));
+  projectList.forEach(p => {
+    const inIt = list.filter(a => a.kind !== "super" && (p.agentIds || []).includes(a.id));
+    if (!inIt.length) return;
+    const head = threadGroup(p.name + (p.status === "archived" ? " · " + L("proj.archived") : ""), inIt.length);
+    head.classList.add("thread-group--project");
+    head.title = L("proj.sidebarHint");
+    head.addEventListener("click", () => { setView("projects"); refreshProjects().then(() => openProject(p)); });
+    el.threadList.appendChild(head);
+    inIt.forEach(renderThread);
+  });
   // Both groups always show, so it's clear where shared agents will appear even before there are any.
   el.threadList.appendChild(threadGroup(L("co.myAgents"), mine.length));
   if (mine.length) mine.forEach(renderThread);
@@ -375,19 +416,46 @@ function renderAgentPanel(agent) {
   // Every agent has a details drawer; the SuperAgent's holds only what it has (memory, run log, messages).
   document.getElementById("agentDetailTitle").textContent = agent.name || "Agent";
   document.getElementById("agentInfoDetails").classList.toggle("is-super", agent.kind === "super");
-  document.getElementById("superSources").hidden = agent.kind !== "super";
-  if (agent.kind === "super") loadSuperSources();
   renderAgentWork(agent);
+  renderAgentProject(agent);
+  renderAgentParent(agent);
   const persona = document.getElementById("agentInfoPersona");
   persona.textContent = agent.persona || "";
   document.getElementById("agentPersonaWrap").hidden = !agent.persona;
   setupPersonaClamp();
   if (!characterChoices.length) loadCharacters().then(() => { if (activeAgent === agent && agent.character) renderAgentPanel(agent); });
-  // Conversations run on what the admin set, not a model of each agent's own (the work runs in tasks).
-  const model = systemSettings.agentDefaultModel || "default";
-  document.getElementById("agentInfoModel").textContent = model;
+  // Conversations run on what the admin set (or, with nothing set, the strongest that can run), not a model of each
+  // agent's own: the work runs in tasks.
+  const modelEl = document.getElementById("agentInfoModel");
+  modelEl.textContent = systemSettings.agentDefaultModel || "";
+  api.agentModel(agent.id).then(r => {
+    if (activeAgent === agent) modelEl.textContent = (r && r.data && r.data.model) || L("chat.noModel");
+  }).catch(() => {});
   renderComposerModel(agent);
   renderAgentSkills(agent);
+}
+
+// The project the agent is in, on its card and in its details; a click opens the project.
+/** The agent it reports to (set when the SuperAgent hired it, or later in a chat with the SuperAgent); click to open it. */
+function renderAgentParent(agent) {
+  const parent = agent.parentId ? agents.find(a => a.id === agent.parentId) : null;
+  const name = agent.parentName || (parent && parent.name);
+  const card = document.getElementById("agentInfoParent");
+  card.hidden = !name;
+  card.textContent = name ? L("agent.parentLine", { name }) : "";
+  card.onclick = parent ? () => selectAgent(parent) : null;
+  document.getElementById("agentDetailParentField").hidden = agent.kind === "super";
+  document.getElementById("agentDetailParent").textContent = name || L("agent.parentNone");
+}
+
+function renderAgentProject(agent) {
+  const p = agent.kind === "super" ? null : projectOfAgentId(agent.id);
+  const card = document.getElementById("agentInfoProject");
+  card.hidden = !p;
+  card.textContent = p ? "📁 " + p.name + (p.status === "archived" ? " · " + L("proj.archived") : "") : "";
+  card.onclick = p ? () => { setView("projects"); openProject(p); } : null;
+  document.getElementById("agentDetailProjectField").hidden = agent.kind === "super";
+  document.getElementById("agentDetailProject").textContent = p ? p.name : L("proj.fNone");
 }
 
 // A long persona is clamped to a few lines with a show-more toggle; a short one shows in full.
@@ -433,9 +501,7 @@ async function renderComposerModel(agent) {
   }
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = systemSettings.agentDefaultModel || failed || cliDefaultWorks(groups)
-    ? L("chat.modelDefault", { model: systemSettings.agentDefaultModel || L("settings.modelCliDefault") })
-    : L("settings.modelPick");
+  def.textContent = L("chat.modelDefault", { model: systemSettings.agentDefaultModel || L("settings.modelAuto") });
   composerModel.appendChild(def);
   fillModelGroups(composerModel, groups, m => m.id);
   // Show the truth when the saved model has since failed its probe, rather than silently displaying another.
@@ -445,8 +511,6 @@ async function renderComposerModel(agent) {
   composerModel.value = agent.model || "";
 }
 
-/** With no model chosen, a turn runs on Claude Code's own default: that only works if Claude Code has a working model. */
-const cliDefaultWorks = groups => groups.some(g => g.key === "claude");
 
 function setNoChatModel(on) {
   noChatModel = on;

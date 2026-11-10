@@ -16,6 +16,7 @@ import com.superagent.core.settings.SystemSettingStore;
 import com.superagent.core.task.Task;
 import com.superagent.core.task.TaskStatus;
 import com.superagent.core.task.TaskStore;
+import com.superagent.core.tenant.CompanyStarted;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -147,6 +148,7 @@ public class NoticeService {
                         upsert(e.owner(), key, Notice.Kind.TRACK, e.title(), null, origin(e), "task", e.taskId());
                     }
                 }
+                case "waiting" -> { } // a complex task whose subtasks are running: still in hand
                 case "running" -> existing.filter(n -> n.kind() == Notice.Kind.CONFIRM && n.state() == Notice.State.OPEN)
                         .ifPresent(n -> save(n.with(Notice.Kind.TRACK, Notice.State.OPEN, n.title(), null, n.actor())));
                 case "needs_confirmation" -> upsert(e.owner(), key, Notice.Kind.CONFIRM, e.title(),
@@ -201,8 +203,31 @@ public class NoticeService {
                 "agent", e.agentId()));
     }
 
+    private com.superagent.core.user.UserStore users; // null in tests: no one to tell
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setUsers(com.superagent.core.user.UserStore users) {
+        this.users = users;
+    }
+
+    /** The admins hear when conversations leave the default model, and when they're back on it (same item). */
+    @EventListener
+    public void onDefaultModel(NoticeEvents.DefaultModelChanged e) {
+        Set<String> admins = new LinkedHashSet<>();
+        if (users != null) {
+            users.listUsers().stream().filter(u -> u.enabled() && u.isAdmin()).forEach(u -> admins.add(u.id()));
+        }
+        String title = e.down() ? "默认模型 " + e.defaultModel() + " 用不了，对话已自动改用 " + e.inUse()
+                : "默认模型 " + e.defaultModel() + " 已恢复，对话已改回";
+        String body = e.down() ? "用户无感知。原因：" + (e.reason() == null || e.reason().isBlank() ? "未知" : e.reason())
+                + "。可到「模型 → 模型配置」检查它的 Key 和可用性，或到「系统设置 → 基础」换默认模型。" : null;
+        for (String admin : admins) {
+            guard(() -> upsert(admin, "default-model", Notice.Kind.NOTICE, title, body, "系统", null, null));
+        }
+    }
+
     /** One-time import of what was already waiting before the to-do page existed. */
-    @EventListener(ApplicationReadyEvent.class)
+    @EventListener(CompanyStarted.class)
     public void backfill() {
         if (settings.all().containsKey(BACKFILLED)) {
             return;
@@ -218,6 +243,7 @@ public class NoticeService {
                 }
             }
             sources.listEnabled(EventSource.FEISHU).forEach(s -> owners.add(s.owner()));
+            sources.listEnabled(EventSource.DINGTALK).forEach(s -> owners.add(s.owner()));
             for (String owner : owners) {
                 for (InboxTodo t : todos.list(owner)) {
                     if (t.status() == InboxTodo.TodoStatus.OPEN) {

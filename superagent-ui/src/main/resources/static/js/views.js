@@ -27,10 +27,10 @@ let modelDetailId = null;
 // View state lives in the URL hash (#tasks, #connectors, …) so a refresh or
 // back/forward restores the same view. Admin-only views fall back to the default
 // for non-admins. See initialView().
-const KNOWN_VIEWS = new Set(["todo", "chat", "files", "tasks", "messages", "skills", "automation", "connectors", "models",
+const KNOWN_VIEWS = new Set(["todo", "chat", "files", "tasks", "messages", "projects", "skills", "automation", "connectors", "models",
   "users", "settings", "integrations", "file-storage", "analytics", "usage", "company-usage", "model-prices"]);
 // The "Workspace" dropdown's pages, and the admin pages (shown with the admin sidebar).
-const WORKSPACE_VIEWS = new Set(["skills", "connectors", "usage"]);
+const WORKSPACE_VIEWS = new Set(["projects", "skills", "connectors", "usage"]);
 const ADMIN_VIEWS = new Set(["settings", "integrations", "file-storage", "analytics", "company-usage", "models", "model-prices", "users"]);
 const DEFAULT_VIEW = "todo"; // the to-do list is home: the first thing to look at each day
 let isAdmin = false;
@@ -42,13 +42,21 @@ function initialView() {
   return view;
 }
 
+/** The page shown now, and the one shown before it (a task opened from a chat goes back to that chat). */
+let currentView = null;
+let enteredTasksFrom = null;
+
 function setView(view) {
+  if (view === "messages") { // the message stream is a tab of the to-do page (old links still land on it)
+    todoFilter = "messages";
+    view = "todo";
+  }
+  const from = currentView;
+  currentView = view;
   if (window.location.hash !== "#" + view) {
     history.replaceState(history.state, document.title, window.location.pathname + window.location.search + "#" + view);
   }
-  // Scheduled tasks are a tab of Tasks, so "Tasks" stays lit for both.
-  const navView = view === "automation" ? "tasks" : view;
-  navItems.forEach(a => a.classList.toggle("is-active", a.dataset.view === navView));
+  navItems.forEach(a => a.classList.toggle("is-active", a.dataset.view === view));
   // Top menu: the dropdown and "Admin" light up for any of their pages; the dropdown also says which one.
   const inWorkspace = WORKSPACE_VIEWS.has(view);
   const inAdmin = ADMIN_VIEWS.has(view);
@@ -72,7 +80,7 @@ function setView(view) {
   const isFileStorage = view === "file-storage";
   const isAutomation = view === "automation";
   const isSkills = view === "skills";
-  const isInbox = view === "messages"; // the message stream, opened from the SuperAgent panel
+  const isProjects = view === "projects";
   const isAnalytics = view === "analytics";
   const isUsage = view === "usage" || view === "company-usage"; // one page: mine, or (admins) the company's
   const isTodo = view === "todo";
@@ -93,10 +101,10 @@ function setView(view) {
   integrationsPane.hidden = !isIntegrations;
   fileStoragePane.hidden = !isFileStorage;
   skPane.hidden = !isSkills;
+  projPane.hidden = !isProjects;
   if (!isSkills && !skel.drawer.hidden) closeSkillDrawer();
-  ibPane.hidden = !isInbox;
   placeholderPane.hidden = isChat || isConnectors || isTasks || isUsers || isModels || isModelPrices || isSettings || isIntegrations
-    || isFileStorage || isAutomation || isSkills || isInbox || isAnalytics || isTodo || isFiles || isUsage;
+    || isFileStorage || isAutomation || isSkills || isProjects || isAnalytics || isTodo || isFiles || isUsage;
   if (!placeholderPane.hidden) placeholderText.textContent = L(placeholderLabels[view] || "placeholder.default");
   if (isConnectors) loadConnectors();
   if (isUsers) loadUsers();
@@ -104,13 +112,15 @@ function setView(view) {
   if (isIntegrations) loadIntegrations();
   if (isFileStorage) loadFileStorage();
   if (isSkills) loadSkills();
-  if (isInbox) loadInbox();
+  if (isProjects) loadProjects();
   if (isAnalytics) loadAnalytics();
   if (isUsage) { usScope = view === "company-usage" ? "all" : "me"; loadUsage(); }
   if (isTodo) loadTodos();
   if (isFiles) loadFiles();
   if (isAutomation) { showAutoList(); loadAutomations(); }
   if (isTasks) { showTaskList(); loadTasks(); } else { stopTaskPolling(); }
+  // Set after showTaskList (which forgets where the list was entered from): a task opened next can go back there.
+  enteredTasksFrom = isTasks && from && from !== "tasks" ? from : null;
   if (isModels) { showModelList(); startModelPolling(); } else { stopModelPolling(); }
   if (isModelPrices) mpLoad();
 }

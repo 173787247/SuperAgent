@@ -105,6 +105,19 @@ public class TaskModelRouter implements TaskModelSelector {
                 + " 重新执行。", Instant.now()));
     }
 
+    @Override
+    public Optional<TaskModelChoice> strongest(Task task) {
+        List<Candidate> forTasks = prices.candidates().stream().filter(Candidate::forTasks).toList();
+        Candidate top = defaultFor(forTasks);
+        if (top == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new TaskModelChoice(task.id(), 0, TaskModelChoice.BY_DEFAULT, "hard", null, top.id(), top.cli(),
+                null, describe(forTasks), "复杂任务：拆分子任务和最后汇总决定整体质量，不按难度省钱，直接用"
+                + (top.id().equals(defaultModel()) ? "默认模型 " : "最贵的 ") + top.id() + "；子任务各自按难度选最便宜够用的模型。",
+                Instant.now()));
+    }
+
     // --- judging ---
 
     private String defaultModel() {
@@ -119,11 +132,15 @@ public class TaskModelRouter implements TaskModelSelector {
                         .orElse(forTasks.isEmpty() ? null : forTasks.get(forTasks.size() - 1)));
     }
 
-    /** The default model first (it judges for conversations too), then the dearest others. */
+    /** What conversations run on (the default model, or its stand-in), then the dearest others. */
     private List<Candidate> judges(List<Candidate> all) {
         List<Candidate> out = new ArrayList<>();
-        String model = defaultModel();
-        all.stream().filter(c -> c.id().equals(model)).findFirst().ifPresent(out::add);
+        for (String m : prices.chatModels()) {
+            all.stream().filter(c -> c.id().equals(m)).findFirst().filter(c -> !out.contains(c)).ifPresent(out::add);
+            if (out.size() >= JUDGES) {
+                return out;
+            }
+        }
         all.stream().filter(Candidate::priced).sorted(Comparator.comparingDouble(Candidate::blended).reversed())
                 .filter(c -> !out.contains(c)).limit(Math.max(0, JUDGES - out.size())).forEach(out::add);
         return out;

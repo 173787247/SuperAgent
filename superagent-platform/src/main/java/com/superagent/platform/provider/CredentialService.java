@@ -6,11 +6,14 @@ import com.superagent.api.provider.CredentialDto;
 import com.superagent.api.provider.CredentialRequests;
 import com.superagent.api.provider.ProviderModelDto;
 import com.superagent.core.chat.RunCredential;
+import com.superagent.core.error.ForbiddenException;
 import com.superagent.core.provider.ModelProvider;
 import com.superagent.core.provider.ModelProviderStore;
 import com.superagent.core.provider.ProviderCredential;
 import com.superagent.core.provider.ProviderCredentialStore;
 import com.superagent.core.security.SecretCipher;
+import com.superagent.core.tenant.Company;
+import com.superagent.core.tenant.TenantContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -80,22 +83,6 @@ public class CredentialService {
         this.cipher = cipher;
         this.probe = probe;
         this.machine = machine;
-    }
-
-    /**
-     * Startup: bring what the machine already has into the console (so it's managed in one place), then tell the
-     * listeners — the CLI config writer among them — which entry each pool uses.
-     */
-    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
-    void onReady() {
-        for (String key : POOLED) {
-            try {
-                importMachine(key);
-            } catch (RuntimeException e) {
-                log.warn("{}: could not import the machine's credentials: {}", key, e.getMessage());
-            }
-            notifySwitch(key);
-        }
     }
 
     /**
@@ -173,6 +160,11 @@ public class CredentialService {
         return Optional.of(next);
     }
 
+    /** Whether this company has a key of its own for this CLI (an enabled pool entry); never throws. */
+    public boolean hasOwnKey(String providerKey) {
+        return POOLED.contains(providerKey) && store.list(providerKey).stream().anyMatch(ProviderCredential::enabled);
+    }
+
     private Choice choose(String providerKey, String excluding) {
         if (!POOLED.contains(providerKey)) {
             return new Choice(null);
@@ -183,10 +175,10 @@ public class CredentialService {
         if (healthy.isPresent()) {
             return new Choice(toRun(healthy.get()));
         }
-        // Every page key is failing: the server's own environment / login is the last resort, unless that
-        // is what just failed — then the best page key, which may have recovered since it was marked.
-        if (!ENV_ID.equals(excluding) || pool.isEmpty()) {
-            return new Choice(null);
+        // Every company runs on its own keys only: never on the machine's environment or CLI logins, which are no
+        // company's (each will have a runtime of its own; for now they share one machine).
+        if (pool.isEmpty()) {
+            throw new NoCompanyKeyException(providerKey);
         }
         return new Choice(toRun(pool.get(0)));
     }
@@ -195,6 +187,13 @@ public class CredentialService {
      * The vendor's official endpoint, from the catalogue. An entry without its own endpoint is always sent there
      * explicitly: left unset, a CLI would fall back to whatever the server's own CLI config points at (a relay, say).
      */
+    /** The company has no key of its own for this CLI. */
+    public static class NoCompanyKeyException extends ForbiddenException {
+        NoCompanyKeyException(String providerKey) {
+            super("本公司还没有配置 " + providerKey + " 的 API Key：请管理员在「模型」里为它添加 Key");
+        }
+    }
+
     private static String defaultBaseUrl(String providerKey) {
         return com.superagent.core.provider.ProviderCatalog.find(providerKey)
                 .map(e -> e.access().defaultBaseUrl()).orElse(null);
@@ -210,8 +209,12 @@ public class CredentialService {
     /** Re-tests every entry of every pool (the periodic sweep): failing ones come back once they answer. */
     public void checkAll() {
         for (String key : POOLED) {
+            if (!hasOwnKey(key)) {
+                continue; // nothing to check for a CLI this company has no key for
+            }
             String before = current(key).id();
-            store.list(key).stream().filter(ProviderCredential::enabled).forEach(this::check);
+            // A failing key every round (so a recovered one takes over again soon); a working one hourly.
+            store.list(key).stream().filter(ProviderCredential::enabled).filter(this::dueForCheck).forEach(this::check);
             if (!current(key).id().equals(before)) {
                 log.info("{}: now using {} (was {})", key, current(key).id(), before);
                 notifySwitch(key);
@@ -219,17 +222,28 @@ public class CredentialService {
         }
     }
 
-    /** One real inference through the entry, on a model the CLI is known to run. */
+    private static final java.time.Duration HEALTHY_RECHECK = java.time.Duration.ofHours(1);
+
+    private boolean dueForCheck(ProviderCredential c) {
+        return !ProviderCredential.OK.equals(c.status()) || c.checkedAt() == null
+                || c.checkedAt().plus(HEALTHY_RECHECK).isBefore(java.time.Instant.now());
+    }
+
+    /**
+     * Whether the entry works: its endpoint's model list when it has one (no tokens), else one tiny inference on a
+     * model the CLI is known to run.
+     */
     ProviderCredential check(ProviderCredential c) {
         String model = testModel(c.providerKey());
         ProviderCredential checked;
-        boolean vendor = VENDOR_CHECKED.contains(c.providerKey()); // these can check a key without a model
-        if (model == null && !vendor) {
+        // Vendors and Codex list models with the key alone; Claude needs a model to ask.
+        boolean keyAlone = VENDOR_CHECKED.contains(c.providerKey()) || "codex".equals(c.providerKey());
+        if (!CHECKED.contains(c.providerKey()) || (model == null && !keyAlone)) {
             checked = c.withHealth(ProviderCredential.UNKNOWN, CHECKED.contains(c.providerKey())
                     ? "还没有可用来测试的模型（等模型列表刷新后再检查）" : "这个 CLI 暂不支持检查 Key");
         } else {
             try {
-                probe.check(c.providerKey(), model, toRun(c));
+                probe.checkKey(c.providerKey(), model, toRun(c));
                 checked = c.withHealth(ProviderCredential.OK, null);
             } catch (IOException e) {
                 checked = c.withHealth(ProviderCredential.ERROR, tail(e.getMessage() == null ? e.toString() : e.getMessage()));
@@ -253,13 +267,13 @@ public class CredentialService {
     }
 
     private void checkSoon(String id) {
-        checker.execute(() -> store.find(id).ifPresent(c -> {
+        checker.execute(TenantContext.wrap(() -> store.find(id).ifPresent(c -> {
             String before = current(c.providerKey()).id();
             check(c);
             if (!current(c.providerKey()).id().equals(before)) {
                 notifySwitch(c.providerKey());
             }
-        }));
+        })));
     }
 
     public CredentialDto checkNow(String providerKey, String id) {
@@ -280,13 +294,9 @@ public class CredentialService {
 
     public List<CredentialDto> list(String providerKey) {
         requirePooled(providerKey);
-        String current = current(providerKey).id();
-        List<CredentialDto> out = new ArrayList<>(store.list(providerKey).stream().map(c -> toDto(c, current)).toList());
-        // The machine's keys are entries above; what's left on the machine is the CLI's own login (a subscription).
-        out.add(new CredentialDto(ENV_ID, null, null, null, false, Integer.MAX_VALUE, true,
-                ProviderCredential.UNKNOWN, null, null, ENV_ID.equals(current), true, ProviderCredential.MACHINE,
-                defaultBaseUrl(providerKey)));
-        return out;
+        // The company's own keys only (an empty pool is simply empty, not an error: that's where keys get added).
+        String current = hasOwnKey(providerKey) ? current(providerKey).id() : null;
+        return store.list(providerKey).stream().map(c -> toDto(c, current)).toList();
     }
 
     public CredentialDto add(String providerKey, CredentialRequests.Save req) {

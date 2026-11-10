@@ -37,5 +37,19 @@ public record TaskDto(
         /** The tier it ran at, when tiers are on; {@code model} is the model that tier meant. */
         String tier,
         /** The chat reply that set it off, in an agent's list of its tasks; null elsewhere. */
-        String originMessageId) {
+        String originMessageId,
+        /** The complex task this is a subtask of, or null. */
+        String parentId,
+        /** The task this one carries on from, or null. */
+        String continuesFrom,
+        /** Its topic tags. */
+        java.util.List<String> tags,
+        /** The agent it runs as (the one that set it off), or null. */
+        String agentId,
+        String agentName,
+        /** A complex task's subtasks: how many, and how many have finished (done, failed for good or stopped). */
+        int subtasks,
+        int subtasksFinished,
+        /** What it cost with its subtasks' spend added in (equal to {@code spend} for any other task). */
+        BigDecimal totalSpend) {
 }

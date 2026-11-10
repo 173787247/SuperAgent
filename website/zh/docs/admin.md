@@ -23,7 +23,7 @@ description: 用户与组织架构、系统设置、连接配置、文件存储,
 - Agent 的默认模型。
 - 公司 Logo,显示在顶部和登录页。
 - 浏览器访问用的**对外地址**(经过代理或域名访问时),OAuth 回调会用到。
-- 是否开启[模型档位](./models#模型档位-预览)。
+- 默认模型出问题时对话换用的备用模型(见[模型怎么选](./models#模型怎么选))。
 
 <Shot name="settings" alt="基本设置:公司信息、Logo、默认模型、对外地址" />
 
@@ -60,4 +60,4 @@ description: 用户与组织架构、系统设置、连接配置、文件存储,
 
 ## 部署
 
-自托管:发布包(tar 包)或 Docker 镜像(预装了编码 CLI),加 MySQL。也支持 ClickHouse 作为存储。见[快速开始](./getting-started)。
+自托管:发布包(tar 包)或 Docker 镜像(预装了编码 CLI),加 MySQL。可选把用量、运行日志、耗时等分析数据放到 ClickHouse。见[快速开始](./getting-started)。

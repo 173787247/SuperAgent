@@ -2,7 +2,10 @@ package com.superagent.cost;
 
 import com.superagent.api.provider.ProviderModelDto;
 import com.superagent.core.settings.SystemSettingStore;
+import com.superagent.core.tenant.TenantContext;
 import com.superagent.platform.provider.ProviderService;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -35,7 +38,17 @@ class ModelPriceServiceTest {
             @Override public Map<String, String> all() { return new HashMap<>(rows); }
             @Override public void put(String key, String value) { if (value == null) rows.remove(key); else rows.put(key, value); }
         };
-        prices = new ModelPriceService(providers, store, "http://unused", 600);
+        prices = new ModelPriceService(null, providers, store, "http://unused", 600);
+    }
+
+    @BeforeEach
+    void inCompany() {
+        TenantContext.set("acme");
+    }
+
+    @AfterEach
+    void leaveCompany() {
+        TenantContext.clear();
     }
 
     @Test
@@ -65,5 +78,48 @@ class ModelPriceServiceTest {
         // Kept out of tasks: still listed, marked off.
         prices.setForTasks("mid", false);
         assertThat(prices.candidates()).filteredOn(c -> !c.forTasks()).extracting(ModelPriceService.Candidate::id).containsExactly("mid");
+    }
+
+    @Test
+    void conversationsLeaveABrokenDefaultForTheBackupThenTheStrongestAndComeBack() throws Exception {
+        for (String id : List.of("strong", "mid", "fast")) {
+            running.add(new ProviderModelDto(id, id, List.of(), null, "none", null, true).withInference("ok", null, null));
+        }
+        prices.useCatalog(ModelCatalog.parse(new ByteArrayInputStream("""
+                {"openai":{"models":{"strong":{"cost":{"input":10,"output":50}},"mid":{"cost":{"input":1,"output":5}},
+                  "fast":{"cost":{"input":0.1,"output":0.5}}}}}
+                """.getBytes(StandardCharsets.UTF_8))));
+        com.superagent.platform.settings.SettingsService settings = mock(com.superagent.platform.settings.SettingsService.class);
+        when(settings.agentDefaultModel()).thenReturn("mid");
+        when(settings.backupModels()).thenReturn(List.of("fast"));
+        prices.setSettings(settings);
+        List<Object> told = new ArrayList<>();
+        prices.setEvents(told::add);
+
+        assertThat(prices.chatModels()).containsExactly("mid", "fast", "strong");
+        assertThat(told).isEmpty();
+
+        prices.reportFailure("mid", "API Error: 503");
+        assertThat(prices.chatModels()).containsExactly("fast", "strong"); // the backup first, then the strongest
+        prices.chatModels();
+        assertThat(told).singleElement().satisfies(e -> {
+            var d = (com.superagent.core.notice.NoticeEvents.DefaultModelChanged) e;
+            assertThat(d.down()).isTrue();
+            assertThat(d.inUse()).isEqualTo("fast");
+            assertThat(d.reason()).contains("503");
+        }); // told once, not on every turn
+        // Another company's runs of the same model are its own: acme's failure doesn't move them.
+        assertThat(TenantContext.call("globex", prices::chatModels).get(0)).isEqualTo("mid");
+        assertThat(told).hasSize(1);
+
+        // Its time out is up: the default is tried again, and the admins hear it's back.
+        prices.forgetFailures();
+        assertThat(prices.chatModels().get(0)).isEqualTo("mid");
+        assertThat(told).hasSize(2);
+        assertThat(((com.superagent.core.notice.NoticeEvents.DefaultModelChanged) told.get(1)).down()).isFalse();
+
+        // None set: the most expensive that can run.
+        when(settings.agentDefaultModel()).thenReturn(null);
+        assertThat(prices.chatModels()).containsExactly("strong", "mid", "fast");
     }
 }

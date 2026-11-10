@@ -30,10 +30,14 @@ import com.superagent.core.chat.ChatStore;
 import com.superagent.core.chat.ImageAttachment;
 import com.superagent.core.chat.MessageRole;
 import com.superagent.core.chat.SessionStatus;
+import com.superagent.core.tenant.TenantContext;
+import com.superagent.core.tenant.TenantPaths;
 import com.superagent.core.user.UserStore;
 import com.superagent.files.FileService;
+import com.superagent.platform.tenant.QuotaService;
 import com.superagent.skills.SkillService;
 import com.superagent.platform.provider.CredentialService;
+import com.superagent.platform.provider.EndpointFailures;
 import com.superagent.platform.provider.ProviderService;
 import com.superagent.platform.settings.SettingsService;
 import com.superagent.runtime.attachment.ImageAttachmentStore;
@@ -101,6 +105,8 @@ public class ChatService {
     private final FileService files;
     private final String defaultModel;
     private final List<String> allowedTools;
+    /** A message at least this long is kept as a file of the agent's (see FileService#keepPasted). */
+    static final int LONG_PASTE_CHARS = 3_000;
     private final boolean skipPermissions;
     private final long sseTimeoutMs;
     private final McpGrants mcpGrants;   // null = chat agents get no SuperAgent MCP
@@ -108,6 +114,12 @@ public class ChatService {
     private final AgentMemoryService memory;
     private final AgentLogService runLog;
     private ChatTaskResults taskResults; // null in tests: no task reports, no task guidance
+    private com.superagent.core.provider.ModelRouter modelRouter; // null in tests: the default model, no stand-in
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setModelRouter(com.superagent.core.provider.ModelRouter modelRouter) {
+        this.modelRouter = modelRouter;
+    }
     private com.superagent.core.usage.UsageRecorder usage; // null in tests: tokens aren't kept
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
@@ -198,6 +210,13 @@ public class ChatService {
     }
 
 
+    private com.superagent.core.timing.TurnTimingStore timings; // null in tests: timings aren't kept
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setTimings(com.superagent.core.timing.TurnTimingStore timings) {
+        this.timings = timings;
+    }
+
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setCredentials(CredentialService credentials) {
         this.credentials = credentials;
@@ -212,6 +231,12 @@ public class ChatService {
     }
 
     private com.superagent.platform.connector.ConnectorService connectors; // null in tests: no company connectors
+    private com.superagent.core.project.ProjectAccess projects; // null in tests: no projects
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setProjects(com.superagent.core.project.ProjectAccess projects) {
+        this.projects = projects;
+    }
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setConnectors(com.superagent.platform.connector.ConnectorService connectors) {
@@ -223,7 +248,7 @@ public class ChatService {
     public SessionDto createSession(CreateSessionRequest request) {
         String id = UUID.randomUUID().toString();
         AgentType agentType = AgentType.fromString(request == null ? null : request.agentType());
-        Path workspace = workspaceRoot.resolve(id);
+        Path workspace = TenantPaths.of(workspaceRoot).resolve(id);
         try {
             Files.createDirectories(workspace);
         } catch (IOException e) {
@@ -269,7 +294,7 @@ public class ChatService {
      */
     public ChatSession ensureDetachedSession(String id, String title) {
         return store.findSession(id).orElseGet(() -> {
-            Path workspace = workspaceRoot.resolve(id);
+            Path workspace = TenantPaths.of(workspaceRoot).resolve(id);
             try {
                 Files.createDirectories(workspace);
             } catch (IOException e) {
@@ -300,11 +325,17 @@ public class ChatService {
      * over), and the agent's long-term memory — not the old conversation — is what the new one starts from.
      */
     public ChatSession sessionForTurn(Agent agent, String model) {
+        return sessionForTurn(agent, model, false);
+    }
+
+    /** {@code modelDown}: the move is because the previous model couldn't run, not because the choice changed. */
+    private ChatSession sessionForTurn(Agent agent, String model, boolean modelDown) {
         ChatSession current = currentSession(agent.id()).orElse(null);
         if (current == null || memory.modelChanged(agent.id(), model)) {
             boolean switching = current != null;
             String previous = memory.lastModel(agent.id());
-            current = startSession(agent, current == null ? null : current.workspaceDir());
+            current = startSession(agent, current == null ? null : current.workspaceDir(), model,
+                    !switching ? ChatSession.FIRST : modelDown ? ChatSession.MODEL_DOWN : ChatSession.MODEL_CHANGED);
             log.info("agent {} starts session {} on model {}", agent.id(), current.id(), model);
             runLog.info(agent, AgentLogService.SESSION, "开新会话 #" + sessionNumber(agent.id(), current.id())
                     + (switching ? "（切换模型：" + modelLabel(previous) + " → " + modelLabel(model) + "）" : "（首次对话）"),
@@ -323,7 +354,7 @@ public class ChatService {
      */
     public ChatSession rotateSession(Agent agent) {
         String workspace = currentSession(agent.id()).map(ChatSession::workspaceDir).orElse(null);
-        ChatSession fresh = startSession(agent, workspace);
+        ChatSession fresh = startSession(agent, workspace, memory.lastModel(agent.id()), ChatSession.FAILURES);
         log.info("agent {} moved to fresh session {}", agent.id(), fresh.id());
         runLog.warn(agent, AgentLogService.SESSION, "会话连续失败 " + memory.failureLimit() + " 次，已切换到新会话 #"
                 + sessionNumber(agent.id(), fresh.id()) + " 并重试", "新会话从 Agent 记忆和最近的对话原文继续；已触发记忆沉淀");
@@ -368,16 +399,37 @@ public class ChatService {
         }
     }
 
-    private ChatSession startSession(Agent agent, String workspaceDir) {
-        if (workspaceDir == null) {
-            return store.findSession(createSession(new CreateSessionRequest(null, agent.name(), null, agent.id())).id())
-                    .orElseThrow();
+    private ChatSession startSession(Agent agent, String workspaceDir, String model, String reason) {
+        String id = UUID.randomUUID().toString();
+        if (workspaceDir == null) { // the agent's first session: its workspace is made now, and later ones share it
+            Path workspace = TenantPaths.of(workspaceRoot).resolve(id);
+            try {
+                Files.createDirectories(workspace);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot create workspace for session " + id, e);
+            }
+            workspaceDir = workspace.toString();
         }
         Instant now = Instant.now();
-        ChatSession session = new ChatSession(UUID.randomUUID().toString(), agent.name(), AgentType.CLAUDE, null,
-                workspaceDir, agent.id(), SessionStatus.ACTIVE, now, now);
+        ChatSession session = new ChatSession(id, agent.name(), AgentType.CLAUDE, null,
+                workspaceDir, agent.id(), SessionStatus.ACTIVE, now, now, model, reason, 0);
         store.createSession(session);
         return session;
+    }
+
+    /** The agent's sessions, newest first: the one its next turn continues, then the ones before it. */
+    public List<com.superagent.api.chat.AgentSessionDto> agentSessions(String agentId) {
+        List<ChatSession> sessions = store.listSessionsByAgent(agentId).stream()
+                .filter(s -> s.status() != SessionStatus.DELETED)
+                .sorted(Comparator.comparing(ChatSession::createdAt)).toList();
+        List<com.superagent.api.chat.AgentSessionDto> out = new ArrayList<>();
+        for (int i = sessions.size() - 1; i >= 0; i--) {
+            ChatSession s = sessions.get(i);
+            int turns = (int) store.listMessages(s.id()).stream().filter(m -> m.role() == MessageRole.ASSISTANT).count();
+            out.add(new com.superagent.api.chat.AgentSessionDto(s.id(), i + 1, i == sessions.size() - 1, s.model(),
+                    s.reason(), s.cliRestarts(), turns, s.createdAt(), s.updatedAt()));
+        }
+        return out;
     }
 
     /** Every session the agent has had, oldest first, each with its messages — the agent's whole conversation. */
@@ -394,7 +446,7 @@ public class ChatService {
         ChatSession s = store.findSession(sessionId).orElseThrow(() -> new SessionNotFoundException(sessionId));
         String clean = title == null || title.isBlank() ? "Untitled" : title.trim();
         ChatSession renamed = new ChatSession(s.id(), clean, s.agentType(), s.agentSessionId(),
-                s.workspaceDir(), s.agentId(), s.status(), s.createdAt(), s.updatedAt());
+                s.workspaceDir(), s.agentId(), s.status(), s.createdAt(), s.updatedAt(), s.model(), s.reason(), s.cliRestarts());
         store.updateSession(renamed);
         return toDto(renamed);
     }
@@ -403,7 +455,8 @@ public class ChatService {
     public void deleteSession(String sessionId) {
         ChatSession s = store.findSession(sessionId).orElseThrow(() -> new SessionNotFoundException(sessionId));
         store.updateSession(new ChatSession(s.id(), s.title(), s.agentType(), s.agentSessionId(),
-                s.workspaceDir(), s.agentId(), SessionStatus.DELETED, s.createdAt(), Instant.now()));
+                s.workspaceDir(), s.agentId(), SessionStatus.DELETED, s.createdAt(), Instant.now(), s.model(), s.reason(),
+                s.cliRestarts()));
     }
 
     public SessionDetailDto getSession(String sessionId) {
@@ -434,11 +487,19 @@ public class ChatService {
         }
         return agentStore.find(session.agentId())
                 .filter(a -> user.equals(a.owner())
-                        || members.members(a.id()).stream().anyMatch(m -> m.username().equals(user)))
+                        || members.members(a.id()).stream().anyMatch(m -> m.username().equals(user))
+                        || (projects != null && projects.sharesProject(a.id(), user)))
                 .isPresent();
     }
 
     // --- sending a message (streamed) ---
+
+    private QuotaService quotas; // null in tests: no limits
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void useQuotas(QuotaService quotas) {
+        this.quotas = quotas;
+    }
 
     public SseEmitter sendMessage(String sessionId, String content) {
         return sendMessage(sessionId, content, List.of(), List.of(), null);
@@ -448,6 +509,10 @@ public class ChatService {
     /** {@code fileIds}: files the user uploaded for this message (see FileService#upload); they go into the workspace. */
     public SseEmitter sendMessage(String requestedSessionId, String content, List<ImageUploadDto> uploads,
                                   List<String> fileIds, String user) {
+        com.superagent.core.timing.TurnTimer timer = new com.superagent.core.timing.TurnTimer(); // from the request on
+        if (quotas != null) {
+            quotas.checkTokens();
+        }
         ChatSession session = store.findSession(requestedSessionId)
                 .orElseThrow(() -> new SessionNotFoundException(requestedSessionId));
         String sessionId = session.id();
@@ -457,6 +522,9 @@ public class ChatService {
                 : customizers.orderedStream().filter(c -> c.handles(agent)).findFirst().orElse(null);
         if (agent != null && agent.isSuper() && special == null) {
             throw new IllegalStateException("SuperAgent chat is not available");
+        }
+        if (agent != null && projects != null && projects.archived(agent.id())) {
+            throw new IllegalArgumentException("这个 Agent 所在的项目已归档，只能查看，不能再对话");
         }
         // One turn at a time: in a shared agent, another member's turn may be running.
         String liveKey = agent != null ? agent.id() : sessionId;
@@ -499,10 +567,21 @@ public class ChatService {
         }
         String text = content == null ? "" : content;
         store.appendMessage(new ChatMessage(userMessageId, sessionId, MessageRole.USER, text, Instant.now(), user));
+        String keptAs = null;
         if (agent != null) {
             files.saveLinks(user, agent.id(), null, sessionId, userMessageId, text); // links are resources too
+            if (text.strip().length() >= LONG_PASTE_CHARS) {
+                // A long paste (an outline, a spec) is material: kept whole in the agent's files, it outlives this
+                // session, and tasks and later sessions can read it instead of a truncated copy.
+                com.superagent.core.file.WorkFile kept = files.keepPasted(user, agent.id(), sessionId, userMessageId, text);
+                keptAs = "（系统：这段长文已自动存为文件「" + kept.name() + "」，id " + kept.id()
+                        + "。开任务要用它时，在任务说明里写上这个文件 id，不要只说「用户发的内容」。）";
+            }
         }
         String prompt = text.isBlank() && !attached.isEmpty() ? ImageAttachmentStore.IMAGE_ONLY_PROMPT : text;
+        if (keptAs != null) {
+            prompt = prompt + "\n\n" + keptAs;
+        }
         if (delivered != null) {
             prompt = (text.isBlank() && attached.isEmpty() ? "" : prompt + "\n\n") + delivered.note();
         }
@@ -524,17 +603,17 @@ public class ChatService {
         // A session's first turn starts from memory plus the latest messages; later turns resume their history
         // (the memory alone still rides along, for when the CLI has to start over on its own).
         String agentMemory = agent == null ? null
-                : session.agentSessionId() == null ? memory.context(agent, Set.of(userMessageId)) : memory.read(agent);
+                : session.agentSessionId() == null ? memory.context(agent, Set.of(userMessageId), user) : memory.read(agent);
         String turnPrompt = prompt;
-        executor.execute(() -> {
+        executor.execute(TenantContext.wrap(() -> {
             try {
                 runTurn(agent, turn, agentType, runner, model, systemPrompt, agentMemory, turnPrompt, attached,
-                        user, userMessageId, assistantMessageId, new TurnStream(emitter, live, agent, special), cancellation);
+                        user, userMessageId, assistantMessageId, new TurnStream(emitter, live, agent, special, timer), cancellation);
             } finally {
                 liveTurns.remove(liveKey, live);
                 live.end();
             }
-        });
+        }));
         return emitter;
     }
 
@@ -552,7 +631,13 @@ public class ChatService {
      * Every conversation runs on the admin's default model, not on a model of its own: the chat thinks and hands out
      * work, which wants the strongest; the work itself runs in tasks, each on a model chosen for it.
      */
-    private String resolveModel(Agent agent) {
+    public String resolveModel(Agent agent) {
+        if (agent != null && modelRouter != null) {
+            List<String> usable = modelRouter.chatModels();
+            if (!usable.isEmpty()) {
+                return usable.get(0); // the default while it works; a stand-in nobody has to notice when it doesn't
+            }
+        }
         String model = settingsService.agentDefaultModel();
         return model != null ? model : defaultModel;
     }
@@ -589,6 +674,9 @@ public class ChatService {
     }
 
     /** How one attempt at a turn went. {@code error} set + blank {@code text} = the attempt failed. */
+    /** How many other models a turn tries when its model can't run. */
+    private static final int MODEL_HOPS = 2;
+
     private record Attempt(ChatSession session, String text, String error, String agentSessionId) {
         boolean failed() {
             return text.isBlank() && error != null;
@@ -611,6 +699,26 @@ public class ChatService {
         try {
             Attempt attempt = attempt(session, agentType, runner, model, systemPrompt, agentMemory, prompt, attached,
                     user, assistantMessageId, emitter, cancellation);
+            // The model itself can't run (endpoint, every key, quota, gone): the same turn again on the next model the
+            // conversation may use, quietly. The failed one is passed over for a while, then tried again.
+            for (int hop = 0; hop < MODEL_HOPS && agent != null && modelRouter != null && attempt.failed()
+                    && !cancellation.isCancelled() && EndpointFailures.isModelFailure(attempt.error()); hop++) {
+                modelRouter.reportFailure(model, attempt.error());
+                String failed = model;
+                String next = modelRouter.chatModels().stream().filter(m -> !m.equals(failed)).findFirst().orElse(null);
+                AgentType nextType = next == null ? null : providerService.cliFor(next).map(AgentType::fromString)
+                        .filter(runners::containsKey).orElse(null);
+                if (nextType == null) {
+                    break;
+                }
+                log.warn("agent {}: {} can't run ({}); this turn moves to {}", agent.id(), model, attempt.error(), next);
+                model = next;
+                agentType = nextType;
+                runner = runners.get(nextType);
+                ChatSession moved = sessionForTurn(agent, next, true); // another model: a new session, from memory + recent messages
+                attempt = attempt(moved, agentType, runner, model, systemPrompt, memory.context(agent, Set.of(userMessageId), user),
+                        prompt, attached, user, assistantMessageId, emitter, cancellation);
+            }
             if (agent != null && !cancellation.isCancelled()) {
                 if (!attempt.failed()) {
                     memory.recordSuccess(agent);
@@ -618,7 +726,7 @@ public class ChatService {
                     retried = true;
                     ChatSession fresh = rotateSession(agent);
                     attempt = attempt(fresh, agentType, runner, model, systemPrompt,
-                            memory.context(agent, Set.of(userMessageId)), prompt, attached, user, assistantMessageId,
+                            memory.context(agent, Set.of(userMessageId), user), prompt, attached, user, assistantMessageId,
                             emitter, cancellation);
                     if (attempt.failed()) {
                         memory.recordFailure(agent, attempt.error());
@@ -630,6 +738,7 @@ public class ChatService {
             store.appendMessage(new ChatMessage(assistantMessageId, attempt.session().id(),
                     MessageRole.ASSISTANT, storedReply(attempt.text(), attempt.error(), cancellation.isCancelled()), Instant.now()));
             saved = true;
+            saveTiming(emitter, attempt.session().id(), assistantMessageId); // before "done": the page reloads then
             persistSessionUpdate(attempt.session(), agentType, attempt.agentSessionId(), prompt);
             logTurn(agent, model, startedAt, attempt, retried, cancellation.isCancelled());
 
@@ -647,6 +756,7 @@ public class ChatService {
             if (!saved) { // keep the error in the conversation, or reopening it shows nothing went wrong
                 store.appendMessage(new ChatMessage(assistantMessageId, session.id(), MessageRole.ASSISTANT,
                         storedReply("", detail, false), Instant.now()));
+                saveTiming(emitter, session.id(), assistantMessageId);
             }
             send(emitter, new StreamEventDto("error", -1, detail));
             emitter.sender().complete();
@@ -670,7 +780,7 @@ public class ChatService {
                 emitter.agent() != null && emitter.agent().isSuper() ? com.superagent.core.usage.UsageContext.SOURCE_SUPERAGENT
                         : com.superagent.core.usage.UsageContext.SOURCE_CHAT,
                 session.agentId(), null, session.id(), agentType.cliName());
-        AgentEventSink sink = com.superagent.core.usage.UsageRecorder.tap(usage, paying, event -> {
+        AgentEventSink sink = emitter.timer().tapTools(com.superagent.core.usage.UsageRecorder.tap(usage, paying, event -> {
             store.appendEvent(new AgentEvent(session.id(), assistantMessageId, event.seq(),
                     event.type(), event.payload(), event.createdAt()));
             switch (event.type()) {
@@ -687,7 +797,7 @@ public class ChatService {
             if (event.type() != AgentEventType.ERROR) {
                 send(emitter, new StreamEventDto(event.type().name().toLowerCase(), event.seq(), event.payload()));
             }
-        });
+        }));
 
         AgentTurnCustomizer special = emitter.special();
         McpGrants.Grant grant = special != null ? special.openGrant(emitter.agent(), user, session, assistantMessageId)
@@ -713,7 +823,7 @@ public class ChatService {
                 tools, skipPermissions && (special == null || special.runsCommands(emitter.agent())), McpGrants.withServers(grant == null ? null : mcpGrants.mcpConfig(grant), connected),
                 systemPrompt, attached, agentMemory, choice.credential());
         try {
-            runOnce(runner, request, sink, cancellation, error, session);
+            runOnce(runner, request, sink, cancellation, error, session, emitter.timer());
             // The endpoint or key failed (auth, quota, server down) before anything was said: switch to the
             // next key in the pool and try the same turn once more, so the user rarely sees the failure.
             boolean nothingSaid = textAccumulator.isEmpty() && resultText.get() == null;
@@ -722,7 +832,8 @@ public class ChatService {
                 if (next.isPresent()) {
                     log.info("session {}: retrying the turn on endpoint {}", session.id(), next.get().id());
                     error.set(null);
-                    runOnce(runner, request.withCredential(next.get().credential()), sink, cancellation, error, session);
+                    runOnce(runner, request.withCredential(next.get().credential()), sink, cancellation, error, session,
+                            emitter.timer());
                 }
             }
         } finally {
@@ -735,14 +846,34 @@ public class ChatService {
     }
 
     private void runOnce(AgentRunner runner, AgentRunRequest request, AgentEventSink sink, Cancellation cancellation,
-                         AtomicReference<String> error, ChatSession session) {
+                         AtomicReference<String> error, ChatSession session, com.superagent.core.timing.TurnTimer timer) {
+        timer.attemptStarted();
         try {
-            runner.run(request, sink, cancellation);
+            runner.runChat(request, sink, cancellation);
         } catch (RuntimeException e) {
             // A runner that blows up is a failed attempt like any other: it may count against the session.
             log.warn("turn attempt failed in session {}: {}", session.id(), e.getMessage());
             error.set(e.getMessage() != null ? e.getMessage() : "agent run failed");
+        } finally {
+            timer.attemptEnded();
         }
+    }
+
+    /** Keeps where the reply's time went, shown under it; losing it must never cost the reply. */
+    private void saveTiming(TurnStream stream, String sessionId, String messageId) {
+        if (timings == null) {
+            return;
+        }
+        try {
+            timings.save(stream.timer().finish(sessionId, messageId, null));
+        } catch (RuntimeException e) {
+            log.warn("could not keep the timing of reply {}: {}", messageId, e.getMessage());
+        }
+    }
+
+    /** The timings of these sessions' replies, for showing under them. */
+    public List<com.superagent.core.timing.TurnTiming> timings(java.util.Collection<String> sessionIds) {
+        return timings == null ? List.of() : timings.forSessions(sessionIds);
     }
 
     /**
@@ -762,8 +893,7 @@ public class ChatService {
                                       String firstPrompt) {
         ChatSession updated = session;
         if (agentType != session.agentType()) {
-            updated = new ChatSession(session.id(), session.title(), agentType, agentSessionId,
-                    session.workspaceDir(), session.agentId(), session.status(), session.createdAt(), Instant.now());
+            updated = session.withAgentType(agentType, agentSessionId);
         } else if (agentSessionId != null && !agentSessionId.equals(session.agentSessionId())) {
             updated = updated.withAgentSessionId(agentSessionId);
         }
@@ -784,7 +914,8 @@ public class ChatService {
      * Where a turn's events go — the sender's own stream and every other viewer of the agent — plus the agent and,
      * for a kind of agent another module runs differently (the SuperAgent), how its turns are set up.
      */
-    record TurnStream(SseEmitter sender, LiveTurn live, Agent agent, AgentTurnCustomizer special) {
+    record TurnStream(SseEmitter sender, LiveTurn live, Agent agent, AgentTurnCustomizer special,
+                      com.superagent.core.timing.TurnTimer timer) {
     }
 
     private void send(TurnStream stream, StreamEventDto event) {
@@ -924,12 +1055,12 @@ public class ChatService {
         return watcher;
     }
 
-    private String displayName(String username) {
-        if (username == null) {
+    private String displayName(String userId) {
+        if (userId == null) {
             return "有人";
         }
-        return users.findByUsername(username).map(u -> u.displayName() == null || u.displayName().isBlank()
-                ? u.username() : u.displayName()).orElse(username);
+        return users.findById(userId).map(u -> u.displayName() == null || u.displayName().isBlank()
+                ? u.username() : u.displayName()).orElse(userId);
     }
 
     @PreDestroy

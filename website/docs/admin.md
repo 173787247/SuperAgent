@@ -23,7 +23,7 @@ The administration area is for administrators only. Its sidebar: **Users**, **Mo
 - The default model for agents.
 - The company logo, shown at the top and on the sign-in page.
 - The **public address** browsers use (behind a proxy or a domain), used for OAuth callbacks.
-- Whether [model tiers](./models#model-tiers-preview) are on.
+- The backup models chats switch to when the default fails (see [how models are chosen](./models#how-models-are-chosen)).
 
 <Shot name="settings" alt="Basic settings: company, logo, default model, public address" />
 
@@ -60,4 +60,4 @@ Not built yet: enterprise approval workflows and isolating what agents run on th
 
 ## Deployment
 
-Self-hosted: a release tarball or a Docker image (with the coding CLIs preinstalled) and MySQL. ClickHouse is also supported as storage. See [Quick start](./getting-started).
+Self-hosted: a release tarball or a Docker image (with the coding CLIs preinstalled) and MySQL. Analytics data (token usage, run logs, turn timing) can optionally go to ClickHouse. See [Quick start](./getting-started).

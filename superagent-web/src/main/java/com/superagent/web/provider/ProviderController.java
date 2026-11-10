@@ -11,6 +11,7 @@ import com.superagent.api.provider.NodeRuntimeDto;
 import com.superagent.platform.provider.CredentialService;
 import com.superagent.platform.provider.NodeRuntimeService;
 import com.superagent.platform.provider.ProviderService;
+import com.superagent.platform.tenant.CompanyService;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -28,8 +29,11 @@ public class ProviderController {
     private final ProviderService service;
     private final NodeRuntimeService node;
     private final CredentialService credentials;
+    private final CompanyService companies;
 
-    public ProviderController(ProviderService service, NodeRuntimeService node, CredentialService credentials) {
+    public ProviderController(ProviderService service, NodeRuntimeService node, CredentialService credentials,
+                              CompanyService companies) {
+        this.companies = companies;
         this.service = service;
         this.node = node;
         this.credentials = credentials;

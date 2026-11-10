@@ -10,7 +10,7 @@ An agent is a colleague the company keeps. Its setup, memory and the files it pr
 ## Creating an agent
 
 - **Persona** — pick one of 24 built-in characters, or write your own. It shapes how the agent works and talks.
-- **Model** — a specific model, or a [tier](./models#model-tiers-preview) (fast / standard / strong) when tiers are turned on. Without either, the system default applies.
+- **Model** — chats use the company's default model, and tasks pick their own; see [how models are chosen](./models#how-models-are-chosen).
 - **Skills** — mount [skills](./files#skills) the agent should follow. You can mount any skill you can see: your own and the company's.
 - **Avatar and name** — so people can tell agents apart.
 
@@ -31,11 +31,25 @@ An agent is a colleague the company keeps. Its setup, memory and the files it pr
 
 ## Working with colleagues
 
-- **One agent, several people.** Add colleagues as members and work on the same job together. Every member's message moves the work forward, and everyone sees the conversation live.
+- **Share Agent: one agent, several people.** Add colleagues as members and work on the same job together. Every member's message moves the work forward, and everyone sees the conversation live.
 - **Invite from the chat.** Ask the agent (or your SuperAgent) to bring someone in. It finds the person in the directory and proposes the invitation; the owner confirms it with one click in the conversation. Removing a member takes effect at once.
 - **Only the owner changes the setup** (persona, model, skills, memory). Members work with the agent as it is.
 
 <Shot name="agent-collab" alt="Several people working with the same agent" />
+
+## Projects
+
+A project brings together the agents and the people working on one piece of work, so everyone sees the same agents, tasks and files.
+
+- **Anyone can start one** and becomes its owner. Only the owner renames it, adds or removes people, and archives or reopens it.
+- **Members use every agent in the project**, with no need to invite them to each agent, and see every task and file made in it, whoever started it.
+- **Agents** — an agent belongs to at most one project; only the agent's owner puts it in or takes it out. Your SuperAgent is never in a project.
+- **Filed automatically** — a task goes to the project of the agent that started it, and a file to its task's project (or its agent's).
+- **Archiving** keeps everything; the project's agents become read-only (no new conversations) until it's reopened.
+
+Find projects under **Workspace → Projects**, with Active and Archived tabs; each project has Agents, Tasks, Files and Members tabs. The agent list groups agents under their project, and Tasks and Files each have a project filter.
+
+<Shot name="projects" alt="A project: its agents, tasks, files and members" />
 
 ## Run log
 
@@ -55,5 +69,6 @@ The to-do page is everyone's home page. It gathers what needs you and what your 
 | Done | Work your agents finished |
 | Notices | Things worth knowing |
 | Ignored | What you set aside, with a way to bring it back |
+| Messages | Messages from Feishu / DingTalk and what your [SuperAgent](./superagent#messages-from-outside) did with each |
 
 The counters at the top show what's open now and how much your agents finished today, this week, this month and in total.

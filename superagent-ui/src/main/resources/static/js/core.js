@@ -29,6 +29,7 @@ const api = {
     }).then(r => { if (!r.ok) throw new Error("edit failed"); return r.json(); }),
   listAgents: () => fetch("/api/v1/agents").then(r => r.json()),
   agentHistory: id => fetch("/api/v1/agents/" + id + "/history").then(r => r.json()),
+  agentModel: id => fetch("/api/v1/agents/" + id + "/model").then(r => r.json()),
   superState: () => fetch("/api/v1/superagent").then(r => r.json()),
   superBackground: () => fetch("/api/v1/superagent/background?limit=300").then(kbJson),
   superWork: (status, memberId, limit) => fetch("/api/v1/superagent/work?status=" + encodeURIComponent(status)
@@ -88,7 +89,25 @@ function renderMarkdown(content) {
     d.textContent = raw;
     return d.innerHTML;
   }
-  return window.DOMPurify.sanitize(window.marked.parse(raw));
+  return tidyTables(window.DOMPurify.sanitize(window.marked.parse(raw)));
+}
+
+/**
+ * Tables in replies: each in a scroll box (a wide one scrolls instead of squeezing), and short cells kept on one line
+ * so labels like "任务标题" or "✅ 已确定" don't break into a column of single characters.
+ */
+function tidyTables(html) {
+  if (html.indexOf("<table") < 0) return html;
+  const box = document.createElement("div");
+  box.innerHTML = html;
+  box.querySelectorAll("table").forEach(t => {
+    const wrap = document.createElement("div");
+    wrap.className = "md-table";
+    t.parentNode.insertBefore(wrap, t);
+    wrap.appendChild(t);
+    t.querySelectorAll("th, td").forEach(c => { if (c.textContent.trim().length <= 10) c.classList.add("is-short"); });
+  });
+  return box.innerHTML;
 }
 
 const isUserRole = role => role === "user";

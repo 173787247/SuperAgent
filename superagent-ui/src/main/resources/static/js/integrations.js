@@ -15,9 +15,10 @@ const intel = {
   modal: document.getElementById("intModal"),
   form: document.getElementById("intForm"),
   title: document.getElementById("intModalTitle"),
-  hint: document.getElementById("intHint"),
-  help: document.getElementById("intHelp"),
-  helpSummary: document.getElementById("intHelpSummary"),
+  guideLink: document.getElementById("intGuideLink"),
+  guide: document.getElementById("intGuide"),
+  guideTitle: document.getElementById("intGuideTitle"),
+  guideBody: document.getElementById("intGuideBody"),
   callbackField: document.getElementById("intCallbackField"),
   callback: document.getElementById("intCallback"),
   fields: document.getElementById("intFields"),
@@ -82,7 +83,8 @@ function integrationRow(i) {
     label.textContent = f.label + "：";
     const value = document.createElement("span");
     value.className = f.set ? "" : "int-config__missing";
-    value.textContent = !f.set ? L("int.notSet") : f.secret ? L("int.secretSet") : f.value;
+    const option = (f.options || []).find(o => o.value === f.value);
+    value.textContent = !f.set ? L("int.notSet") : f.secret ? L("int.secretSet") : option ? option.label : f.value;
     line.append(label, value);
     config.appendChild(line);
   });
@@ -95,7 +97,13 @@ function integrationRow(i) {
   edit.className = "link-btn";
   edit.textContent = L("common.edit");
   edit.addEventListener("click", () => openIntegration(i));
-  act.appendChild(edit);
+  const guide = document.createElement("button");
+  guide.type = "button";
+  guide.className = "link-btn link-btn--muted";
+  guide.textContent = L("int.guide");
+  guide.addEventListener("click", () => openIntegrationGuide(i));
+  guide.hidden = !hasIntegrationGuide(i);
+  act.append(guide, edit);
   actions.appendChild(act);
 
   tr.append(name, status, config, actions);
@@ -105,20 +113,23 @@ function integrationRow(i) {
 function openIntegration(i) {
   intEditing = i;
   intel.title.textContent = i.name;
-  intel.hint.textContent = L("int.hint." + i.key);
-  intel.help.open = false;
-  intel.helpSummary.textContent = L(i.callbackUrl ? "int.helpWithCallback" : "int.help");
   intel.callbackField.hidden = !i.callbackUrl;
   intel.callback.value = i.callbackUrl || "";
+  intel.guideLink.hidden = !hasIntegrationGuide(i);
   intel.fields.innerHTML = "";
   i.fields.forEach(f => {
     const label = document.createElement("label");
     label.className = "field";
     const span = document.createElement("span");
     span.textContent = f.label;
-    const input = document.createElement("input");
-    input.type = f.secret ? "password" : "text";
-    input.autocomplete = f.secret ? "new-password" : "off";
+    const choice = (f.options || []).length > 0;
+    const input = document.createElement(choice ? "select" : "input");
+    if (choice) {
+      f.options.forEach(o => input.appendChild(new Option(o.label, o.value)));
+    } else {
+      input.type = f.secret ? "password" : "text";
+      input.autocomplete = f.secret ? "new-password" : "off";
+    }
     input.dataset.key = f.key;
     input.value = f.secret ? "" : (f.value || "");
     // A stored secret is never sent to the browser; leaving the field empty keeps it.
@@ -138,7 +149,7 @@ intel.callback.addEventListener("focus", () => intel.callback.select());
 intel.form.addEventListener("submit", async e => {
   e.preventDefault();
   const values = {};
-  intel.fields.querySelectorAll("input[data-key]").forEach(inp => { values[inp.dataset.key] = inp.value.trim(); });
+  intel.fields.querySelectorAll("input[data-key], select[data-key]").forEach(inp => { values[inp.dataset.key] = inp.value.trim(); });
   intel.submit.disabled = true;
   intel.error.hidden = true;
   try {
@@ -158,3 +169,95 @@ intel.form.addEventListener("submit", async e => {
 
 intel.modal.querySelectorAll("[data-close]").forEach(x => x.addEventListener("click", () => { intel.modal.hidden = true; }));
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !intel.modal.hidden) intel.modal.hidden = true; });
+
+// ---------- setup guide: how to create the app on the other side ----------
+// Steps are i18n strings ("int.guide.<key>.<n>"), read until one is missing. The callback URL (when the system
+// has one) is shown where a step needs it, with a copy button: it must be entered there exactly.
+
+/** Whether a guide was written for this system (its first step exists); new systems may not have one yet. */
+const hasIntegrationGuide = i => L("int.guide." + i.key + ".1") !== "int.guide." + i.key + ".1";
+
+function openIntegrationGuide(i) {
+  intel.guideTitle.textContent = L("int.guideTitle", { name: i.name });
+  const body = intel.guideBody;
+  body.replaceChildren();
+  const introKey = "int.guide." + i.key + ".intro";
+  if (L(introKey) !== introKey) {
+    const intro = document.createElement("p");
+    intro.className = "int-guide__intro";
+    intro.textContent = L(introKey);
+    body.appendChild(intro);
+  }
+
+  const ol = document.createElement("ol");
+  ol.className = "int-guide__steps";
+  for (let n = 1; ; n++) {
+    const k = "int.guide." + i.key + "." + n;
+    const text = L(k);
+    if (text === k) break; // no such step
+    const li = document.createElement("li");
+    const p = document.createElement("p");
+    p.textContent = text;
+    li.appendChild(p);
+    if (i.callbackUrl && L(k + ".callback") === "1") li.appendChild(guideCallback(i.callbackUrl));
+    ol.appendChild(li);
+  }
+  body.appendChild(ol);
+
+  const note = L("int.guide." + i.key + ".note");
+  if (note !== "int.guide." + i.key + ".note") {
+    const n = document.createElement("p");
+    n.className = "int-guide__note";
+    n.textContent = note;
+    body.appendChild(n);
+  }
+  const link = guideConsoleUrl(i);
+  if (!/^https:\/\//.test(link)) { intel.guide.hidden = false; return; }
+  const open = document.createElement("a");
+  open.className = "btn btn--sm";
+  open.href = link;
+  open.target = "_blank";
+  open.rel = "noopener noreferrer";
+  open.textContent = L("int.guideGo", { name: i.name });
+  body.appendChild(open);
+  intel.guide.hidden = false;
+}
+
+/**
+ * Where the provider's app console is. Feishu's "domain" choice (feishu | lark) picks the platform: the one in the
+ * open edit form when it's this integration (it may not be saved yet), else the saved value.
+ */
+function guideConsoleUrl(i) {
+  const url = L("int.guide." + i.key + ".url");
+  if (i.key !== "feishu") return url;
+  const open = intEditing && intEditing.key === i.key && !intel.modal.hidden
+    ? intel.fields.querySelector('[data-key="domain"]') : null;
+  const saved = (i.fields || []).find(f => f.key === "domain");
+  const domain = open ? open.value : saved ? saved.value : null;
+  return domain === "lark" ? "https://open.larksuite.com/app" : url;
+}
+
+/** The callback URL, copyable, with where to change it if it's wrong. */
+function guideCallback(url) {
+  const box = document.createElement("div");
+  box.className = "int-guide__callback";
+  const code = document.createElement("code");
+  code.textContent = url;
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "btn btn--sm";
+  copy.textContent = L("int.copy");
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(url); showToast(L("int.copied"), false); }
+    catch (e) { showToast(url, false); }
+  });
+  const hint = document.createElement("small");
+  hint.textContent = L("int.callbackHint");
+  box.append(code, copy, hint);
+  return box;
+}
+
+intel.guideLink.addEventListener("click", () => { if (intEditing) openIntegrationGuide(intEditing); });
+intel.guide.querySelectorAll("[data-close]").forEach(x => x.addEventListener("click", () => { intel.guide.hidden = true; }));
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !intel.guide.hidden) intel.guide.hidden = true; });
+

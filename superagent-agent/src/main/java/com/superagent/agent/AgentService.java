@@ -18,6 +18,7 @@ import com.superagent.core.agent.AgentMemberStore;
 import com.superagent.core.agent.AgentStatus;
 import com.superagent.core.agent.AgentStore;
 import com.superagent.core.notice.NoticeEvents;
+import com.superagent.core.tenant.CompanyStarted;
 import com.superagent.core.user.User;
 import com.superagent.core.user.UserStore;
 import com.superagent.platform.user.PeopleDirectory;
@@ -72,13 +73,11 @@ public class AgentService {
     private final ApplicationEventPublisher events;
     private final UserStore users;
     private final PeopleDirectory people;
-    private final String adminUsername;
     private final Object superLock = new Object();
 
     public AgentService(AgentStore store, ChatService chatService, SkillService skills, AgentMemoryService memory,
                         AgentMemberStore members, UserStore users,
-                        ApplicationEventPublisher events, PeopleDirectory people,
-                        @Value("${superagent.auth.admin.username:admin}") String adminUsername) {
+                        ApplicationEventPublisher events, PeopleDirectory people) {
         this.events = events;
         this.members = members;
         this.users = users;
@@ -87,22 +86,6 @@ public class AgentService {
         this.chatService = chatService;
         this.skills = skills;
         this.memory = memory;
-        this.adminUsername = adminUsername;
-    }
-
-    /**
-     * Agents created before agents had owners belong to nobody, so no one would see them any more.
-     * They are handed to the initial admin rather than shown to everyone.
-     */
-    @EventListener(ApplicationReadyEvent.class)
-    void claimUnownedAgents() {
-        List<Agent> orphans = store.list().stream().filter(a -> a.owner() == null).toList();
-        for (Agent a : orphans) {
-            store.update(a.withOwner(adminUsername));
-        }
-        if (!orphans.isEmpty()) {
-            log.info("assigned {} agent(s) created before agents had owners to {}", orphans.size(), adminUsername);
-        }
     }
 
     public AgentDto create(CreateAgentRequest request, String owner) {
@@ -223,9 +206,20 @@ public class AgentService {
         memory.forget(agent); // the agent's memory goes with it; its chat history is kept like the agent row
     }
 
+    /** Its sessions, newest first; callers check access first. */
+    public List<com.superagent.api.chat.AgentSessionDto> sessions(String id) {
+        return chatService.agentSessions(id);
+    }
+
     /** The agent's whole conversation: every session it has had, oldest first. */
     public List<ChatSegmentDto> history(String id, String user) {
         return chatService.agentHistory(requireViewer(id, user).id());
+    }
+
+    /** Where each reply's time went, for everyone who can read the conversation. */
+    public List<com.superagent.api.timing.TurnTimingDto> timings(String id, String user) {
+        List<String> sessions = chatService.agentHistory(requireViewer(id, user).id()).stream().map(ChatSegmentDto::sessionId).toList();
+        return chatService.timings(sessions).stream().map(com.superagent.api.timing.TurnTimingDto::of).toList();
     }
 
     /** Only built-ins are accepted, so an avatar is always a known, short emoji. */
@@ -252,10 +246,11 @@ public class AgentService {
         people.add(new AgentMemberDto(a.owner(), displayName(a.owner()), "owner"));
         members.members(a.id()).forEach(m -> people.add(new AgentMemberDto(m.username(), displayName(m.username()),
                 "collaborator")));
+        String parent = parentOf(a.id());
         return new AgentDto(a.id(), a.name(), a.avatar(), a.character(), a.persona(), a.model(), skills.agentSkillIds(a.id()),
                 a.status().name().toLowerCase(), a.kind().name().toLowerCase(), a.managedBy(), sessionId,
                 a.createdAt(), a.updatedAt(), a.owner(), Objects.equals(a.owner(), viewer) ? "owner" : "collaborator",
-                people, shareable(a), a.tier());
+                people, shareable(a), a.tier(), parent, parent == null ? null : findName(parent));
     }
 
     // --- memory ---
@@ -280,13 +275,69 @@ public class AgentService {
         return memory(id, user);
     }
 
+    private com.superagent.core.project.ProjectAccess projects; // null in tests: no projects
+    /** The model its conversation runs on (the default, or the strongest that can run); null when none can. */
+    public String model(String id, String user) {
+        return chatService.resolveModel(requireViewer(id, user));
+    }
+    private com.superagent.core.agent.AgentParentStore parents; // null in tests: no parent agents
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setParents(com.superagent.core.agent.AgentParentStore parents) {
+        this.parents = parents;
+    }
+
+    // --- parent agents ---
+
+    /**
+     * Puts the owner's agent under another of theirs ({@code parentId} null or blank: under no one). The SuperAgent
+     * leads everyone, so it neither has a parent nor is one; an agent can't end up under itself.
+     */
+    public void setParent(String agentId, String owner, String parentId) {
+        Agent agent = require(agentId, owner);
+        if (agent.isSuper()) {
+            throw new IllegalArgumentException("SuperAgent 不能有上级");
+        }
+        if (parents == null) {
+            throw new IllegalStateException("parent agents need a parent store");
+        }
+        String parent = trimToNull(parentId);
+        if (parent != null) {
+            Agent above = require(parent, owner);
+            if (above.isSuper()) {
+                throw new IllegalArgumentException("SuperAgent 本来就带领所有 Agent，不用设为上级；不设上级即可");
+            }
+            for (String at = parent; at != null; at = parentOf(at)) {
+                if (at.equals(agentId)) {
+                    throw new IllegalArgumentException("「" + above.name() + "」是「" + agent.name() + "」的下级，不能反过来做它的上级");
+                }
+            }
+        }
+        parents.set(agentId, parent);
+    }
+
+    /** The agent's parent, while that agent still exists. */
+    public String parentOf(String agentId) {
+        if (parents == null) {
+            return null;
+        }
+        return parents.parentOf(agentId).filter(p -> store.find(p).filter(a -> a.status() != AgentStatus.DELETED).isPresent())
+                .orElse(null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setProjects(com.superagent.core.project.ProjectAccess projects) {
+        this.projects = projects;
+    }
+
     // --- collaboration ---
 
     /** Owner or active collaborator: may see the agent's conversation and direct it. */
     public Agent requireViewer(String id, String user) {
         Agent agent = store.find(id).filter(a -> a.status() != AgentStatus.DELETED)
                 .orElseThrow(() -> new AgentNotFoundException(id));
-        if (Objects.equals(agent.owner(), user) || isMember(id, user)) {
+        if (Objects.equals(agent.owner(), user) || isMember(id, user)
+                || (projects != null && projects.sharesProject(id, user))) {
             return agent;
         }
         throw new AgentNotFoundException(id); // someone else's private agent reads as "not found"
@@ -296,9 +347,13 @@ public class AgentService {
         return user != null && members.members(agentId).stream().anyMatch(m -> m.username().equals(user));
     }
 
-    /** Agents others shared with the user, live ones only. */
+    /** Agents others shared with the user, one by one or through a project they are in; live ones only. */
     private List<Agent> sharedWith(String user) {
-        return members.agentsOf(user).stream().map(store::find).flatMap(Optional::stream)
+        java.util.Set<String> ids = new java.util.LinkedHashSet<>(members.agentsOf(user));
+        if (projects != null) {
+            ids.addAll(projects.agentsThroughProjects(user));
+        }
+        return ids.stream().map(store::find).flatMap(Optional::stream)
                 .filter(a -> a.status() != AgentStatus.DELETED && !Objects.equals(a.owner(), user))
                 .toList();
     }
@@ -319,20 +374,23 @@ public class AgentService {
         }
         Instant now = Instant.now();
         for (String raw : usernames == null ? List.<String>of() : usernames) {
-            String username = raw == null ? "" : raw.strip();
-            if (username.isEmpty() || username.equals(owner) || isMember(id, username)) {
+            String name = raw == null ? "" : raw.strip();
+            if (name.isEmpty()) {
                 continue;
             }
-            User user = people.find(username).filter(User::enabled)
-                    .orElseThrow(() -> new IllegalArgumentException("No such user: " + username));
-            members.save(new AgentMember(id, user.username(), owner, true, now, now));
-            events.publishEvent(new NoticeEvents.AgentShared(id, agent.name(), user.username(), displayName(owner)));
-            log.info("agent {} shared by {} with {}", id, owner, username);
+            User user = people.resolve(name).filter(User::enabled)
+                    .orElseThrow(() -> new IllegalArgumentException("No such user: " + name));
+            if (user.id().equals(owner) || isMember(id, user.id())) {
+                continue;
+            }
+            members.save(new AgentMember(id, user.id(), owner, true, now, now));
+            events.publishEvent(new NoticeEvents.AgentShared(id, agent.name(), user.id(), displayName(owner)));
+            log.info("agent {} shared by {} with {}", id, owner, user.id());
         }
         return toDto(agent, chatService.currentSessionId(id), owner);
     }
 
-    /** Usernames of the agent's active collaborators (the owner isn't one). */
+    /** User ids of the agent's active collaborators (the owner isn't one). */
     public List<String> memberUsernames(String id) {
         return members.members(id).stream().map(AgentMember::username).toList();
     }
@@ -342,8 +400,9 @@ public class AgentService {
         return shareable(require(id, owner));
     }
 
-    /** The owner removes someone, or a collaborator leaves (username = themselves). */
-    public void removeMember(String id, String caller, String username) {
+    /** The owner removes someone, or a collaborator leaves (themselves). {@code who}: a user id or username. */
+    public void removeMember(String id, String caller, String who) {
+        String username = people.resolve(who).map(User::id).orElse(who);
         Agent agent = requireViewer(id, caller);
         boolean self = Objects.equals(caller, username);
         if (!self && !Objects.equals(agent.owner(), caller)) {
@@ -353,11 +412,12 @@ public class AgentService {
                 .ifPresent(m -> members.save(new AgentMember(id, username, m.addedBy(), false, m.createdAt(), Instant.now())));
     }
 
-    public String displayName(String username) {
-        if (username == null) {
+    /** A person's name to show, from their user id. */
+    public String displayName(String userId) {
+        if (userId == null) {
             return null;
         }
-        return people.find(username).map(u -> u.displayName() == null || u.displayName().isBlank()
-                ? u.username() : u.displayName()).orElse(username);
+        return people.find(userId).map(u -> u.displayName() == null || u.displayName().isBlank()
+                ? u.username() : u.displayName()).orElse(userId);
     }
 }

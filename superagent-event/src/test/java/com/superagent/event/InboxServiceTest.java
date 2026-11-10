@@ -11,6 +11,9 @@ import com.superagent.core.org.OrgStore;
 import com.superagent.core.user.User;
 import com.superagent.core.user.UserSource;
 import com.superagent.core.user.UserStore;
+import com.superagent.core.tenant.TenantContext;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -29,6 +32,16 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class InboxServiceTest {
+
+    @BeforeEach
+    void inCompany() {
+        TenantContext.set("acme");
+    }
+
+    @AfterEach
+    void leaveCompany() {
+        TenantContext.clear();
+    }
 
     private static final class Events implements InboxEventStore {
         final Map<String, InboxEvent> rows = new LinkedHashMap<>();
@@ -63,7 +76,7 @@ class InboxServiceTest {
 
     private static final class Users implements UserStore {
         @Override public List<User> listUsers() { return List.of(); }
-        @Override public Optional<User> findById(String id) { return Optional.empty(); }
+        @Override public Optional<User> findById(String id) { return findByUsername(id); } // ids are the names here
         @Override public Optional<User> findByUsername(String name) {
             Instant now = Instant.now();
             return Optional.of(new User(name, name, "boss".equals(name) ? "老板" : null, Set.of("USER"), true,
@@ -97,7 +110,7 @@ class InboxServiceTest {
 
     @Test
     void triagesLikeAPersonWhoKnowsTheOrgChart() {
-        InboxService inbox = new InboxService(new Events(), new Sources(), new Recorder(), new Org(), new Users(), 30);
+        InboxService inbox = new InboxService(null, new Events(), new Sources(), new Recorder(), new Org(), new Users(), 30);
         Map<String, String> people = inbox.people("ada");
         assertThat(people).containsEntry("老板", "上级").containsEntry("boss", "上级").containsEntry("intern", "下属");
         assertThat(TriageRules.triage(msg("1", "p2p", true, "老板", "看下这个"), false, false, people).priority()).isEqualTo(EventPriority.P0);
@@ -116,7 +129,7 @@ class InboxServiceTest {
         Sources sources = new Sources();
         Recorder processor = new Recorder();
         sources.save(source());
-        InboxService inbox = new InboxService(events, sources, processor, new Org(), new Users(), 30);
+        InboxService inbox = new InboxService(null, events, sources, processor, new Org(), new Users(), 30);
         List<String> pushed = new ArrayList<>();
         inbox.registerNotifier(EventSource.FEISHU, (s, text) -> pushed.add(text));
 

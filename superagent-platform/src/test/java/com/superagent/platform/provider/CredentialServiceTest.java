@@ -24,11 +24,23 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class CredentialServiceTest {
+
+    @org.junit.jupiter.api.BeforeEach
+    void inCompany() {
+        // The host's company: the only one that may fall back to the machine's own environment / CLI login.
+        com.superagent.core.tenant.TenantContext.set(com.superagent.core.tenant.Company.DEFAULT_ID);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void leaveCompany() {
+        com.superagent.core.tenant.TenantContext.clear();
+    }
 
     private static final class InMemoryPool implements ProviderCredentialStore {
         final Map<String, ProviderCredential> rows = new LinkedHashMap<>();
@@ -57,6 +69,9 @@ class CredentialServiceTest {
                 throw new IOException("HTTP 429: quota exceeded");
             }
         }
+        @Override public void checkKey(String key, String model, RunCredential c) throws IOException {
+            check(key, model, c);
+        }
     }
 
     @TempDir
@@ -72,18 +87,22 @@ class CredentialServiceTest {
         CredentialService svc = new CredentialService(pool, providers,
                 new SecretCipher("", tmp.resolve("secret.key").toString()), probe, null);
 
-        assertThat(svc.current("claude").id()).isEqualTo(CredentialService.ENV_ID); // nothing configured yet
+        // Every company runs on its own keys only, never the machine's: without one it is told to add one.
+        assertThatThrownBy(() -> svc.current("claude")).isInstanceOf(CredentialService.NoCompanyKeyException.class);
+        assertThatThrownBy(() -> com.superagent.core.tenant.TenantContext.call("acme", () -> svc.current("claude")))
+                .isInstanceOf(CredentialService.NoCompanyKeyException.class);
+        assertThat(svc.list("claude")).isEmpty(); // the key page still opens, to add the first one
         String main = svc.add("claude", new CredentialRequests.Save("官方", "", "sk-ant-main-0000000001", false, null)).id();
         String relay = svc.add("claude", new CredentialRequests.Save("中转", "https://relay.example/", "relay-token-000000002", true, null)).id();
         assertThat(svc.current("claude").credential().apiKey()).isEqualTo("sk-ant-main-0000000001");
         // No endpoint of its own: sent to the official address explicitly, never left to the server's CLI config.
         assertThat(svc.current("claude").credential().baseUrl()).isEqualTo("https://api.anthropic.com");
 
-        // The page sees a masked key and the env fallback as the last, read-only entry.
+        // The page sees masked keys, and only the company's own.
         List<CredentialDto> listed = svc.list("claude");
         assertThat(listed).extracting(CredentialDto::keyHint).first().isEqualTo("sk-a…0001");
         assertThat(listed.get(1).baseUrl()).isEqualTo("https://relay.example");
-        assertThat(listed.get(2).env()).isTrue();
+        assertThat(listed).hasSize(2);
 
         // A quota error is the key's fault: mark it, retry on the relay. A bad request is not: no switch.
         assertThat(svc.failover("claude", svc.current("claude"), "API Error: 400 prompt is too long")).isEmpty();
@@ -91,8 +110,8 @@ class CredentialServiceTest {
         assertThat(next.id()).isEqualTo(relay);
         assertThat(svc.current("claude").id()).isEqualTo(relay);
 
-        // The relay fails too: the server environment is the last resort.
-        assertThat(svc.failover("claude", next, "connect ECONNREFUSED").orElseThrow().id()).isEqualTo(CredentialService.ENV_ID);
+        // The relay fails too: nothing healthy left, so it stays on the company's best key (never the machine's).
+        assertThat(svc.failover("claude", next, "connect ECONNREFUSED").orElseThrow().id()).isEqualTo(main);
 
         // The periodic check sees the main key answer again (and the relay still down): back to priority order.
         probe.down.add("relay-token-000000002");

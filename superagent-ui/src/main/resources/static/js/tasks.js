@@ -4,9 +4,18 @@
 
 // ---------- tasks ----------
 Object.assign(api, {
-  listTasks: (page, status) => fetch("/api/v1/tasks?page=" + page + "&size=" + TASK_PAGE_SIZE
-    + (status ? "&status=" + encodeURIComponent(status) : "")).then(r => r.json()),
-  taskStats: () => fetch("/api/v1/tasks/stats").then(r => r.json()),
+  listTasks: (page, status, narrow) => fetch("/api/v1/tasks?page=" + page + "&size=" + TASK_PAGE_SIZE
+    + (status ? "&status=" + encodeURIComponent(status) : "")
+    + ["project", "tag", "agent", "source"].map(k => narrow && narrow[k] ? "&" + k + "=" + encodeURIComponent(narrow[k]) : "").join(""))
+    .then(r => r.json()),
+  taskFacets: () => fetch("/api/v1/tasks/facets").then(kbJson),
+  taskRelations: id => fetch("/api/v1/tasks/" + id + "/relations").then(kbJson),
+  setTaskTags: (id, tags) => fetch("/api/v1/tasks/" + id + "/tags", {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }),
+  }).then(kbJson),
+  createTask: body => fetch("/api/v1/tasks", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }).then(kbJson),
   taskDetail: id => fetch("/api/v1/tasks/" + id).then(r => r.json()),
   taskAgents: () => fetch("/api/v1/tasks/agents").then(r => r.json()),
   taskStatus: id => fetch("/api/v1/tasks/" + id + "/status").then(r => r.json()),
@@ -23,10 +32,12 @@ Object.assign(api, {
 
 const TASK_STATUS_LABEL = {
   pending: L("status.pending"), running: L("status.running"), needs_confirmation: L("status.needs_confirmation"),
+  waiting: L("status.waiting"),
   done: L("status.done"), error: L("status.error"), stopped: L("status.stopped"),
 };
 const TASK_SOURCE_LABEL = {
   web_chat: L("tasks.srcWebChat"), task_form: L("tasks.srcTaskForm"), automation: L("tasks.srcAutomation"),
+  inbox: L("tasks.srcInbox"),
 };
 
 const tel = {
@@ -48,6 +59,7 @@ const tel = {
   promptBody: document.getElementById("taskPromptBody"),
   tabs: document.getElementById("taskTabs"),
   runPane: document.getElementById("taskRunPane"),
+  live: document.getElementById("taskLive"),
   sessionInfo: document.getElementById("taskSessionInfo"),
   files: document.getElementById("taskFiles"),
   filesEmpty: document.getElementById("taskFilesEmpty"),
@@ -63,22 +75,32 @@ const tel = {
   confirmEdit: document.getElementById("taskConfirmEdit"),
   steerInput: document.getElementById("taskSteerInput"),
   steerBtn: document.getElementById("taskSteerBtn"),
+  subtasksTab: document.getElementById("taskSubtasksTab"),
+  subtasks: document.getElementById("taskSubtasks"),
+  subtasksSum: document.getElementById("taskSubtasksSum"),
+  rel: document.getElementById("taskDetailRel"),
+  tags: document.getElementById("taskTags"),
+  followBtn: document.getElementById("taskFollowBtn"),
+  followList: document.getElementById("taskFollowList"),
+  followUps: document.getElementById("taskFollowUps"),
 };
 
 const task = { id: null, renderedEvents: 0, mergeEl: null, mergeType: null, toolGroup: null, pollTimer: null };
 
-function isActiveStatus(s) { return s === "running" || s === "pending"; }
+// "waiting": a complex task whose subtasks are running; it carries on by itself.
+function isActiveStatus(s) { return s === "running" || s === "pending" || s === "waiting"; }
 
 function showTaskList() {
   stopTaskPolling();
   task.id = null;
+  taskBack.length = 0;
+  enteredTasksFrom = null;
   tel.detailView.hidden = true;
   tel.listView.hidden = false;
 }
 
 const TASK_PAGE_SIZE = 20;
 let taskPage = 1;
-let taskFilter = ""; // "" = all; otherwise the stat card the user clicked
 let agentOptions = [];  // [{key, name, models:[ProviderModelDto]}] from /tasks/agents
 
 // Tasks are only ever created by agents and automations, so the list just pages through them.
@@ -91,109 +113,179 @@ function renderTaskPager(page) {
   tel.pagerNext.disabled = page.page >= pages;
 }
 
-// The overview above the list. Each card is also a filter: click to see just those tasks, click again for all.
-const TASK_STAT_CARDS = [
-  { key: "", label: "tasks.statTotal", value: s => s.total },
-  { key: "active", label: "tasks.statActive", value: s => s.active },
-  { key: "needs_confirmation", label: "tasks.statWaiting", value: s => s.needsConfirmation, tone: "warn" },
-  { key: "done", label: "tasks.statDoneToday", value: s => s.doneToday, tone: "ok" },
-  { key: "error", label: "tasks.statFailed", value: s => s.failed, tone: "bad" },
-  { key: null, label: "tasks.statSpend", value: s => "$" + Number(s.spendThisMonth || 0).toFixed(2) },
-];
-
-// Scheduled-task cards; each also filters the Scheduled tab (keys match its filters).
-const SCHEDULED_STAT_CARDS = [
-  { key: "all", label: "auto.statTotal", value: l => l.length },
-  { key: "active", label: "auto.statEnabled", value: l => l.filter(a => a.enabled).length, tone: "ok" },
-  { key: "recurring", label: "auto.typeRecurring", value: l => l.filter(a => a.type === "recurring").length },
-  { key: "once", label: "auto.typeOnce", value: l => l.filter(a => a.type === "once").length },
-];
-let workStats = null;     // task counters from /tasks/stats
-let workSchedules = [];   // the user's scheduled tasks
-
-// Tasks and scheduled tasks share one stats strip at the top of both tabs; clicking a card filters its tab.
-async function loadTaskStats() {
-  const [s, a] = await Promise.all([api.taskStats().catch(() => null), api.listAutomations().catch(() => null)]);
-  workStats = s && s.data;
-  workSchedules = (a && a.data) || [];
-  renderWorkStats();
-}
-
-function renderWorkStats() {
-  const onScheduled = !document.querySelector('[data-pane="automation"]').hidden;
-  const owner = document.getElementById("autoOwnerFilter");
-  const schedules = owner && owner.value === "all" ? workSchedules : workSchedules.filter(a => a.owner === currentUsername);
-  document.querySelectorAll("[data-work-stats]").forEach(box => {
-    const taskCards = workStats ? TASK_STAT_CARDS.map(c => statCard(L(c.label), c.value(workStats), c.tone,
-      c.key === null ? null : !onScheduled && c.key === taskFilter, () => {
-        taskFilter = !onScheduled && taskFilter === c.key ? "" : c.key;
-        taskPage = 1;
-        if (onScheduled) setView("tasks"); else loadTasks();
-      })) : [];
-    const scheduleCards = SCHEDULED_STAT_CARDS.map(c => statCard(L(c.label), c.value(schedules), c.tone,
-      onScheduled && c.key === autoFilter, () => {
-        autoFilter = onScheduled && autoFilter === c.key ? "all" : c.key;
-        if (onScheduled) renderAutomations(); else setView("automation");
-      }));
-    box.replaceChildren(statGroup(L("tasks.tabTasks"), taskCards), statGroup(L("tasks.tabScheduled"), scheduleCards));
-  });
-}
-
-function statGroup(label, cards) {
-  const g = document.createElement("div");
-  g.className = "work-stats__group";
-  const h = document.createElement("div");
-  h.className = "work-stats__label";
-  h.textContent = label;
-  const grid = document.createElement("div");
-  grid.className = "stat-cards stat-cards--filter";
-  grid.append(...cards);
-  g.append(h, grid);
-  return g;
-}
-
-/** {@code active === null}: a plain figure, not a filter. */
-function statCard(label, value, tone, active, onClick) {
-  const card = document.createElement(active === null ? "div" : "button");
-  card.className = "stat-card" + (tone ? " is-" + tone : "") + (active ? " is-active" : "");
-  if (active !== null) {
-    card.type = "button";
-    card.addEventListener("click", onClick);
-  }
-  const v = document.createElement("span");
-  v.className = "stat-card__value";
-  v.textContent = value;
-  const l = document.createElement("span");
-  l.className = "stat-card__label";
-  l.textContent = label;
-  card.append(v, l);
-  return card;
-}
-
 async function loadTasks() {
   if (!agentOptions.length) await loadAgentOptions();
   let list = [];
   let page = null;
-  loadTaskStats();
-  try { const res = await api.listTasks(taskPage, taskFilter); page = res && res.data; } catch (e) { /* ignore */ }
+  loadTaskFacets();
+  try { const res = await api.listTasks(taskPage, "", taskNarrow); page = res && res.data; } catch (e) { /* ignore */ }
   list = (page && page.items) || [];
+  tfEl.sum.textContent = page && taskNarrow.tag
+    ? L("tasks.filterSum", { n: page.total, spend: "$" + Number(page.spend || 0).toFixed(2) }) : "";
   if (page) taskPage = page.page; // the server clamps a page past the end (e.g. after deletes)
   renderTaskPager(page);
   tel.rows.innerHTML = "";
   tel.empty.hidden = list.length > 0;
-  list.forEach(t => tel.rows.appendChild(taskRow(t)));
+  list.forEach(t => {
+    tel.rows.appendChild(taskRow(t));
+    if (taskExpanded.has(t.id)) showSubtaskRows(t); // kept open across reloads
+  });
 }
 
-function taskRow(t) {
+// ---------- a complex task's subtasks, as a tree under it in the list ----------
+const taskExpanded = new Set();
+
+function toggleSubtaskRows(t) {
+  if (taskExpanded.has(t.id)) {
+    taskExpanded.delete(t.id);
+    tel.rows.querySelectorAll('tr[data-parent="' + CSS.escape(t.id) + '"]').forEach(r => r.remove());
+    setRowOpen(t.id, false);
+  } else {
+    taskExpanded.add(t.id);
+    showSubtaskRows(t);
+  }
+}
+
+async function showSubtaskRows(t) {
+  setRowOpen(t.id, true);
+  let r = null;
+  try { r = await api.taskRelations(t.id); } catch (e) { return; }
+  const parentRow = tel.rows.querySelector('tr[data-id="' + CSS.escape(t.id) + '"]');
+  if (!parentRow || !taskExpanded.has(t.id)) return; // the list was redrawn or the row closed meanwhile
+  tel.rows.querySelectorAll('tr[data-parent="' + CSS.escape(t.id) + '"]').forEach(x => x.remove());
+  const subs = (r && r.subtasks) || [];
+  let after = parentRow;
+  subs.forEach((s, i) => {
+    const row = taskRow(Object.assign({ parentId: t.id }, s), { child: true, last: i === subs.length - 1 });
+    after.after(row);
+    after = row;
+  });
+}
+
+function setRowOpen(id, open) {
+  const row = tel.rows.querySelector('tr[data-id="' + CSS.escape(id) + '"]');
+  if (!row) return;
+  row.classList.toggle("is-open", open);
+  const btn = row.querySelector(".t-tree");
+  if (btn) btn.setAttribute("aria-expanded", String(open));
+}
+
+// ---------- narrowing the list by topic tag: one chip per tag, "All" first ----------
+const taskNarrow = { project: "", tag: "", agent: "", source: "" };
+const tfEl = {
+  box: document.getElementById("taskFilter"),
+  bar: document.getElementById("taskTagBar"),
+  sum: document.getElementById("taskFilterSum"),
+};
+
+async function loadTaskFacets() {
+  let f = null;
+  try { f = await api.taskFacets(); } catch (e) { f = {}; }
+  const tags = f.tags || [];
+  // Keep a chosen tag even once it has no tasks left, so the filter doesn't silently drop.
+  if (taskNarrow.tag && !tags.some(t => t.key === taskNarrow.tag)) tags.push({ key: taskNarrow.tag, label: taskNarrow.tag, count: 0 });
+  // Always there, with "All" even before any task is tagged: the list keeps its shape.
+  tfEl.bar.replaceChildren(tagBarChip(L("tasks.filterAll"), null, ""),
+    ...tags.map(t => tagBarChip("#" + t.label, t.count, t.key)));
+}
+
+function tagBarChip(label, count, key) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "tag-bar__chip" + (taskNarrow.tag === key ? " is-active" : "");
+  b.setAttribute("role", "tab");
+  b.setAttribute("aria-selected", String(taskNarrow.tag === key));
+  const name = document.createElement("span");
+  name.textContent = label;
+  b.appendChild(name);
+  if (count != null) {
+    const n = document.createElement("span");
+    n.className = "tag-bar__count";
+    n.textContent = count;
+    b.appendChild(n);
+  }
+  b.addEventListener("click", () => {
+    taskNarrow.tag = taskNarrow.tag === key ? "" : key;
+    taskPage = 1;
+    loadTasks();
+  });
+  return b;
+}
+
+/** Narrows the list to one tag (from a tag chip). */
+function filterByTag(tag) {
+  taskNarrow.tag = tag;
+  taskPage = 1;
+  showTaskList();
+  loadTasks();
+}
+
+/** general | coding | complex | subtask (a complex task's part). */
+function taskKind(t) {
+  if (t.parentId) return "subtask";
+  return t.flow === "coding" || t.flow === "complex" ? t.flow : "general";
+}
+
+/** Small chips under a task's title: its kind (a complex one with how far its subtasks are), a follow-up, its tags. */
+function taskChips(t) {
+  const row = document.createElement("div");
+  row.className = "t-chips";
+  const chip = (text, hint) => {
+    const c = document.createElement("span");
+    c.className = "t-chip t-chip--kind";
+    c.textContent = text;
+    c.title = hint;
+    row.appendChild(c);
+  };
+  if (t.continuesFrom) chip(L("tasks.chipFollowUp"), L("tasks.chipFollowUpHint"));
+  (t.tags || []).forEach(tag => {
+    const c = document.createElement("button");
+    c.type = "button";
+    c.className = "t-chip t-chip--tag";
+    c.textContent = "#" + tag;
+    c.title = L("tasks.tagFilterHint");
+    c.addEventListener("click", e => { e.stopPropagation(); filterByTag(tag); });
+    row.appendChild(c);
+  });
+  return row.childElementCount ? row : null;
+}
+
+/** {@code opts.child}: a subtask drawn under its complex task ({@code opts.last}: the last of them). */
+function taskRow(t, opts = {}) {
   const tr = document.createElement("tr");
+  tr.dataset.id = t.id;
+  if (opts.child) {
+    tr.dataset.parent = t.parentId;
+    tr.className = "t-row--child" + (opts.last ? " is-last" : "");
+  }
   tr.addEventListener("click", () => openTask(t.id));
 
   const tdTask = document.createElement("td");
+  tdTask.className = "t-task";
   const title = document.createElement("div");
   title.className = "t-title";
-  title.textContent = t.title;
+  const kind = taskKind(t);
+  if (kind === "complex" && t.subtasks) {
+    const tree = document.createElement("button");
+    tree.type = "button";
+    tree.className = "t-tree";
+    tree.setAttribute("aria-expanded", "false");
+    tree.title = L("tasks.showSubtasks");
+    tree.addEventListener("click", e => { e.stopPropagation(); toggleSubtaskRows(t); });
+    title.appendChild(tree);
+  } else if (!opts.child) {
+    const pad = document.createElement("span");
+    pad.className = "t-tree-pad";
+    title.appendChild(pad);
+  }
+  const name = document.createElement("span");
+  name.className = "t-title__text";
+  name.textContent = t.title;
+  title.appendChild(name);
   tdTask.appendChild(title);
-  const metaBits = [t.repo, t.branch, t.flow].filter(Boolean);
+  const chips = taskChips(t);
+  if (chips) tdTask.appendChild(chips);
+  const metaBits = [t.repo, t.branch].filter(Boolean); // the kind is a chip above
   if (metaBits.length) {
     const sub = document.createElement("small");
     sub.className = "t-sub";
@@ -209,10 +301,42 @@ function taskRow(t) {
   if (t.sessionId) sess.title = t.sessionId;
   tdTask.appendChild(sess);
 
+  const tdKind = document.createElement("td");
+  const kindPill = document.createElement("span");
+  kindPill.className = "t-kind is-" + kind;
+  kindPill.textContent = L("tasks.kind_" + kind);
+  kindPill.title = L("tasks.kindHint_" + kind);
+  tdKind.appendChild(kindPill);
+
+  // How many subtasks and how many are over, for a complex task; nothing for the rest.
+  const tdSubs = document.createElement("td");
+  tdSubs.className = "t-subs";
+  if (kind === "complex") {
+    if (t.subtasks) {
+      const n = document.createElement("span");
+      n.className = "t-subs__n";
+      n.textContent = t.subtasksFinished + " / " + t.subtasks;
+      const mini = document.createElement("span");
+      mini.className = "t-subs__bar";
+      const fill = document.createElement("i");
+      fill.style.width = Math.round(t.subtasksFinished / t.subtasks * 100) + "%";
+      mini.appendChild(fill);
+      tdSubs.append(n, mini);
+    } else {
+      tdSubs.textContent = L(t.status === "done" ? "tasks.subtasksNoneShort" : "tasks.subtasksPlanningShort");
+      tdSubs.classList.add("is-muted");
+    }
+  } else {
+    tdSubs.textContent = "—";
+    tdSubs.classList.add("is-muted");
+  }
+
   const tdAgent = document.createElement("td");
   tdAgent.className = "t-agent";
   const agentName = document.createElement("div");
-  agentName.textContent = agentLabel(t.agentType);
+  // The agent it ran as, when an agent set it off; else the CLI it ran in.
+  agentName.textContent = t.agentName || agentLabel(t.agentType);
+  if (t.agentName) agentName.title = agentLabel(t.agentType);
   const modelName = document.createElement("small");
   modelName.textContent = taskModelLabel(t);
   tdAgent.append(agentName, modelName);
@@ -223,18 +347,20 @@ function taskRow(t) {
   const tdCreated = document.createElement("td");
   tdCreated.className = "t-created";
   tdCreated.textContent = formatDateTime(t.createdAt);
-  if (t.createdBy) { const by = document.createElement("small"); by.textContent = t.createdBy; tdCreated.appendChild(by); }
+  if (t.createdBy) { const by = document.createElement("small"); by.textContent = personName(t.createdBy); tdCreated.appendChild(by); }
 
   const tdSpend = document.createElement("td");
   tdSpend.className = "t-spend";
-  tdSpend.textContent = "$" + Number(t.spend || 0).toFixed(2);
+  // A complex task's spend includes its subtasks'.
+  tdSpend.textContent = "$" + Number(t.totalSpend != null ? t.totalSpend : t.spend || 0).toFixed(2);
+  if (t.subtasks && Number(t.totalSpend) !== Number(t.spend)) tdSpend.title = L("tasks.spendTotalHint");
 
   const tdStatus = document.createElement("td");
   const cell = document.createElement("div");
   cell.className = "t-status-cell";
   const top = document.createElement("div");
   top.className = "t-status-top";
-  top.appendChild(statusBadge(t.status));
+  top.appendChild(listStatusBadge(t));
   const elapsed = document.createElement("span");
   elapsed.className = "t-elapsed";
   elapsed.textContent = formatElapsed(t);
@@ -259,7 +385,8 @@ function taskRow(t) {
   wrap.appendChild(del);
   tdActions.appendChild(wrap);
 
-  tr.append(tdTask, tdAgent, tdSource, tdCreated, tdSpend, tdStatus, tdActions);
+  if (opts.child) del.hidden = true; // a subtask goes with its complex task
+  tr.append(tdTask, tdKind, tdSubs, tdAgent, tdSource, tdCreated, tdSpend, tdStatus, tdActions);
   return tr;
 }
 
@@ -270,6 +397,16 @@ function statusBadge(status) {
   return b;
 }
 
+/** A complex task whose subtasks are all over and that is at work again: it is writing the summary. */
+const summingUp = t => t.flow === "complex" && t.subtasks > 0 && t.subtasksFinished >= t.subtasks
+  && (t.status === "running" || t.status === "pending");
+
+function listStatusBadge(t) {
+  const b = statusBadge(t.status);
+  if (summingUp(t)) b.textContent = L("tasks.summingUp");
+  return b;
+}
+
 async function deleteTask(t) {
   if (!window.confirm(L("tasks.deleteConfirm", { name: t.title }))) return;
   try { await api.deleteTask(t.id); } catch (e) { /* ignore */ }
@@ -277,7 +414,20 @@ async function deleteTask(t) {
   await loadTasks();
 }
 
-async function openTask(id) {
+// Where the back button goes: the task (and tab) shown before this one, or the page the task was opened from.
+const taskBack = []; // [{ task, tab } | { view }]
+const currentTaskTab = () => (tel.tabs.querySelector(".model-tab.is-active") || {}).dataset?.tab || null;
+
+async function openTask(id, opts = {}) {
+  if (!opts.back) {
+    if (enteredTasksFrom) { // opened from a chat, to-do, projects…: back returns there
+      taskBack.length = 0;
+      taskBack.push({ view: enteredTasksFrom });
+      enteredTasksFrom = null;
+    } else if (task.id && task.id !== id && !tel.detailView.hidden) {
+      taskBack.push({ task: task.id, tab: currentTaskTab() });
+    }
+  }
   task.id = id;
   task.renderedEvents = 0;
   task.mergeEl = null;
@@ -296,7 +446,7 @@ async function openTask(id) {
 function renderDetail(d) {
   const t = d.task;
   tel.dTitle.textContent = t.title;
-  const meta = [TASK_SOURCE_LABEL[t.source] || t.source, t.repo, t.branch, t.flow].filter(Boolean).join(" · ");
+  const meta = [L("tasks.kind_" + taskKind(t)), TASK_SOURCE_LABEL[t.source] || t.source, t.repo, t.branch].filter(Boolean).join(" · ");
   tel.dMeta.textContent = meta;
   if (t.source === "automation") linkScheduledTask(t.id);
 
@@ -323,6 +473,12 @@ function renderDetail(d) {
   updateStatusUi(t);
   renderFacts(t);
   renderSessionInfo(t);
+  renderTaskTags(t);
+  task.current = t;
+  task.relKey = null;
+  tel.subtasksTab.hidden = t.flow !== "complex";
+  tel.subtasksTab.textContent = L("tasks.tabSubtasks", { n: t.subtasks || 0 });
+  loadTaskRelations(t);
   renderPhases(d.phases);
   task.hasPhases = !!(d.phases && d.phases.length);
   // Only a task with a flow of its own (coding) has phases; the rest just run.
@@ -332,10 +488,12 @@ function renderDetail(d) {
   // A finished task opens on what it came up with; one still at work on its run log.
   const last = [...(d.events || [])].reverse().find(e => e.type === "result");
   renderTaskOutput(last ? last.payload : null, t);
-  setTaskTab(last && t.status === "done" ? "output" : "run");
+  // A complex task still at work opens on its subtasks: that is where its progress is.
+  setTaskTab(last && t.status === "done" ? "output" : t.flow === "complex" && t.subtasks ? "subtasks" : "run");
   loadTaskFiles(t.id);
   task.choiceKey = t.status + "|" + t.model;
   loadModelChoices(t);
+  loadTaskTiming(t.id);
   loadTaskUsage(t.id);
   task.lastPhaseKey = t.status + "|" + t.progress;
   if (isActiveStatus(t.status)) startTaskPolling(); else stopTaskPolling();
@@ -520,6 +678,7 @@ function setEvBody(bodyEl, kind, fullRaw) {
 }
 
 function appendStreamItem(item) {
+  task.lastEventAt = item.at ? Math.min(Date.now(), new Date(item.at).getTime()) : Date.now(); // replayed: when it happened
   const type = item.kind;
   // The CLI's own system events carry just its session id: noise. SuperAgent's notes (moving to a stronger
   // model after a failure) are worth showing.
@@ -527,7 +686,9 @@ function appendStreamItem(item) {
 
   // A run of tool calls folds into one compact, collapsible block (one row per call).
   if (type === "tool_use" || type === "tool_result") { appendToolEvent(item); return; }
-  // Any non-tool event ends the current tool group, so the next call starts a fresh one.
+  // Any non-tool event ends the current tool group, so the next call starts a fresh one. The agent has moved on, so a
+  // call still showing as running is done (MCP tools often send no result event of their own).
+  if (task.toolGroup && task.toolGroup.pendingRow) finishToolRow(task.toolGroup.pendingRow, "");
   task.toolGroup = null;
 
   const mergeable = type === "text" || type === "thinking";
@@ -666,16 +827,39 @@ function finishToolRow(handle, result) {
   }
 }
 
+/** The run is over: nothing is still being called, whatever events went missing. */
+function finishAllToolRows() {
+  tel.stream.querySelectorAll(".evtool.is-using").forEach(row => {
+    row.className = "evtool is-done";
+    const lead = row.querySelector(".evtool__lead");
+    if (lead) lead.textContent = L("ev.usedTool");
+  });
+  if (task.toolGroup) task.toolGroup.pendingRow = null;
+}
+
+// While a task runs, a line under its log says it's still at work and how long since the last thing it showed: some
+// CLIs (Codex) only show a reply once it's written, so a long summary otherwise looks stuck.
+setInterval(() => {
+  const t = task.current;
+  const on = !!t && t.status === "running" && !document.hidden;
+  tel.live.hidden = !on;
+  if (!on) return;
+  const quiet = Math.max(0, Math.round((Date.now() - (task.lastEventAt || Date.now())) / 1000));
+  const what = L(summingUp(t) ? "tasks.liveSumming" : "tasks.liveWorking");
+  tel.live.textContent = quiet >= 10 ? L("tasks.liveQuiet", { what, d: tmDuration(quiet * 1000) }) : what;
+}, 1000);
+
 // The run pane is the scrolling container (the stream itself never overflows).
 function scrollStream() { tel.runPane.scrollTop = tel.runPane.scrollHeight; }
 
 function updateStatusUi(t) {
   tel.dStatus.className = "status-badge is-" + t.status;
-  tel.dStatus.textContent = TASK_STATUS_LABEL[t.status] || t.status;
+  tel.dStatus.textContent = summingUp(t) ? L("tasks.summingUp") : TASK_STATUS_LABEL[t.status] || t.status;
   tel.progress.className = "progress" + (t.status === "error" ? " is-error" : isActiveStatus(t.status) ? " is-running" : "");
   tel.progressBar.style.width = (t.progress || 0) + "%";
   tel.progressPct.textContent = (t.progress || 0) + "%";
   const busy = isActiveStatus(t.status);
+  if (!busy) finishAllToolRows();
   tel.steerInput.disabled = busy;
   tel.steerBtn.disabled = busy;
   taskImages.setDisabled(busy);
@@ -684,6 +868,8 @@ function updateStatusUi(t) {
   const waiting = t.status === "pending" && !!t.sessionId;
   tel.steerInput.placeholder = waiting ? L("tasks.steerWaiting") : busy ? L("tasks.steerBusy") : L("tasks.steer");
   tel.stopBtn.disabled = !busy;
+  // Carrying on: once it has come to something, and not for a subtask (its complex task carries on instead).
+  tel.followBtn.hidden = !!t.parentId || !["done", "error", "stopped"].includes(t.status);
   renderConfirmBar(t);
 }
 
@@ -726,19 +912,28 @@ function taskModelLabel(t) {
 }
 
 function renderFacts(t) {
+  fillFacts(tel.facts, factsOf(t));
+}
+
+function factsOf(t) {
   const facts = [
+    [L("tasks.kind"), L("tasks.kind_" + taskKind(t)), L("tasks.kindHint_" + taskKind(t))],
     [L("tasks.agent"), agentLabel(t.agentType)],
     [L("tasks.model"), taskModelLabel(t)],
     // No effort setting exists yet: tasks run at the CLI's default.
     [L("tasks.effort"), L("tasks.effortDefault"), L("tasks.effortHint")],
     [L("tasks.session"), t.sessionId ? t.sessionId.slice(0, 8) : "—", t.sessionId || ""],
     [L("tasks.created"), formatDateTime(t.createdAt)],
-    [L("tasks.by"), t.createdBy || "—"],
+    [L("tasks.by"), personName(t.createdBy) || "—"],
     [L("tasks.spend"), "$" + Number(t.spend || 0).toFixed(2)],
     [L("tasks.elapsed"), formatElapsed(t)],
   ];
+  // A complex task costs what it spent plus what its subtasks did (from its relations, fetched alongside).
+  if (t.subtasks && task.relTotal && task.relTotal.id === t.id) {
+    facts.push([L("tasks.spendTotal"), "$" + Number(task.relTotal.spend || 0).toFixed(2), L("tasks.spendTotalHint")]);
+  }
   if (t.error) facts.push([L("tasks.error"), t.error]);
-  fillFacts(tel.facts, facts);
+  return facts;
 }
 
 function renderSessionInfo(t) {
@@ -832,6 +1027,8 @@ async function pollTask() {
     updateStatusUi(t);
     renderFacts(t);
     renderSessionInfo(t);
+    task.current = t;
+    loadTaskRelations(t); // refetched only when its subtasks or its status moved on
     // The model is decided before the task starts, and again whenever it moves to a dearer one after failing.
     if (task.choiceKey !== t.status + "|" + t.model) { task.choiceKey = t.status + "|" + t.model; loadModelChoices(t); loadTaskUsage(t.id); }
     // Phases only change when the task moves on: refetch the (large) detail then, not every poll.
@@ -840,6 +1037,7 @@ async function pollTask() {
       task.lastPhaseKey = phaseKey;
       try { const dRes = await api.taskDetail(id); if (dRes && dRes.data) renderPhases(dRes.data.phases); } catch (e) { /* ignore */ }
     }
+    if (task.timingKey !== t.status) { task.timingKey = t.status; loadTaskTiming(id); } // a turn ended or the task moved on
     if (!isActiveStatus(t.status)) { stopTaskPolling(); loadTaskFiles(id); }
   } catch (e) { /* ignore transient poll errors */ }
 }
@@ -886,7 +1084,20 @@ function autoGrowSteer() {
   tel.steerInput.style.height = Math.min(tel.steerInput.scrollHeight, 160) + "px";
 }
 
-tel.back.addEventListener("click", () => { showTaskList(); loadTasks(); });
+tel.back.addEventListener("click", async () => {
+  const prev = taskBack.pop();
+  if (prev && prev.task) {
+    await openTask(prev.task, { back: true });
+    if (prev.tab && task.id === prev.task) setTaskTab(prev.tab);
+  } else if (prev && prev.view) {
+    const view = prev.view;
+    showTaskList();
+    setView(view);
+  } else {
+    showTaskList();
+    loadTasks();
+  }
+});
 tel.pagerPrev.addEventListener("click", () => { taskPage = Math.max(1, taskPage - 1); loadTasks(); });
 tel.pagerNext.addEventListener("click", () => { taskPage += 1; loadTasks(); });
 tel.stopBtn.addEventListener("click", async () => { if (task.id) { try { await api.stopTask(task.id); } catch (e) { /* ignore */ } } });
@@ -921,3 +1132,193 @@ async function linkScheduledTask(taskId) {
   link.addEventListener("click", () => { setView("automation"); openAutomation(a.id); });
   tel.dMeta.append(" · ", link);
 }
+
+// ---------- how a task stands to others: its complex task, its subtasks, what it carries on ----------
+
+/** Refetches only when something that changes them moved: the status, or how far the subtasks are. */
+async function loadTaskRelations(t) {
+  // While its subtasks run, look again every ten seconds so their own states show too.
+  const key = t.status + "|" + (t.subtasks || 0) + "|" + (t.subtasksFinished || 0)
+    + (t.status === "waiting" ? "|" + Math.floor(Date.now() / 10000) : "");
+  if (task.relKey === key) return;
+  task.relKey = key;
+  let r = null;
+  try { r = await api.taskRelations(t.id); } catch (e) { return; }
+  if (task.id !== t.id) return;
+  renderRelationLine(r);
+  renderSubtasks(t, r);
+  renderFollowUps(r);
+  task.relTotal = { id: t.id, spend: r.totalSpend };
+  renderFacts(task.current && task.current.id === t.id ? task.current : t);
+}
+
+/** Under the title: the complex task this is part of, or the task it carries on from, as links. */
+function renderRelationLine(r) {
+  const bits = [];
+  const link = (label, other) => {
+    const wrap = document.createElement("span");
+    wrap.append(document.createTextNode(label + " "));
+    const a = document.createElement("button");
+    a.type = "button";
+    a.className = "link-btn";
+    a.textContent = other.title;
+    a.addEventListener("click", () => openTask(other.id));
+    wrap.appendChild(a);
+    bits.push(wrap);
+  };
+  if (r.parent) link(L("tasks.relParent"), r.parent);
+  if (r.continuesFrom) link(L("tasks.relFrom"), r.continuesFrom);
+  tel.rel.replaceChildren(...bits);
+  tel.rel.hidden = !bits.length;
+}
+
+function renderSubtasks(t, r) {
+  const subs = r.subtasks || [];
+  tel.subtasksTab.textContent = L("tasks.tabSubtasks", { n: subs.length });
+  if (t.flow !== "complex") return;
+  const finished = subs.filter(s => ["done", "error", "stopped"].includes(s.status)).length;
+  const spent = subs.reduce((n, s) => n + Number(s.spend || 0), 0);
+  tel.subtasksSum.textContent = subs.length
+    ? L("tasks.subtasksSum", { done: finished, n: subs.length, spend: "$" + spent.toFixed(2) })
+    : L(t.status === "done" ? "tasks.subtasksNone" : "tasks.subtasksPlanning");
+  tel.subtasks.replaceChildren(...subs.map(subtaskRow));
+}
+
+function subtaskRow(s) {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "subtask";
+  row.addEventListener("click", () => openTask(s.id));
+  const title = document.createElement("span");
+  title.className = "subtask__title";
+  title.textContent = s.title;
+  const model = document.createElement("span");
+  model.className = "subtask__meta";
+  model.textContent = taskModelLabel(s);
+  const spend = document.createElement("span");
+  spend.className = "subtask__meta subtask__num";
+  spend.textContent = "$" + Number(s.spend || 0).toFixed(2);
+  const time = document.createElement("span");
+  time.className = "subtask__meta subtask__num";
+  time.textContent = formatElapsed(s);
+  row.append(statusBadge(s.status), title, model, spend, time);
+  if (s.error) row.title = s.error;
+  return row;
+}
+
+function renderFollowUps(r) {
+  const list = r.followUps || [];
+  tel.followList.hidden = !list.length;
+  tel.followUps.replaceChildren(...list.map(f => {
+    const li = document.createElement("li");
+    const a = document.createElement("button");
+    a.type = "button";
+    a.className = "link-btn";
+    a.textContent = f.title;
+    a.addEventListener("click", () => openTask(f.id));
+    li.append(statusBadge(f.status), a);
+    return li;
+  }));
+}
+
+// ---------- tags: set automatically when a task is done; the owner can change them ----------
+
+function renderTaskTags(t) {
+  const box = tel.tags;
+  box.replaceChildren();
+  (t.tags || []).forEach(tag => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "t-chip t-chip--tag";
+    chip.textContent = "#" + tag;
+    chip.title = L("tasks.tagFilterHint");
+    chip.addEventListener("click", () => filterByTag(tag));
+    box.appendChild(chip);
+  });
+  if (!(t.tags || []).length) {
+    const none = document.createElement("span");
+    none.className = "task-tags__none";
+    none.textContent = L(t.parentId ? "tasks.tagsSubtask" : t.status === "done" ? "tasks.tagsNone" : "tasks.tagsLater");
+    box.appendChild(none);
+  }
+  if (!t.parentId) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "link-btn link-btn--muted";
+    edit.textContent = L("common.edit");
+    edit.addEventListener("click", () => editTaskTags(t));
+    box.appendChild(edit);
+  }
+}
+
+/** The tags as one line of text, separated by spaces or commas. */
+function editTaskTags(t) {
+  const box = tel.tags;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "task-tags__input";
+  input.value = (t.tags || []).join(" ");
+  input.placeholder = L("tasks.tagsPh");
+  input.setAttribute("aria-label", L("tasks.tags"));
+  const save = async () => {
+    const tags = input.value.split(/[\s,，、#]+/).filter(Boolean);
+    try {
+      const res = await api.setTaskTags(t.id, tags);
+      t.tags = res.tags;
+      if (task.current && task.current.id === t.id) task.current.tags = res.tags;
+    } catch (e) { showToast(e.message, true); }
+    renderTaskTags(t);
+  };
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); save(); }
+    else if (e.key === "Escape") renderTaskTags(t);
+  });
+  input.addEventListener("blur", save);
+  box.replaceChildren(input);
+  input.focus();
+}
+
+// ---------- carrying on: a new task that starts from this one's conclusion ----------
+const tflEl = {
+  modal: document.getElementById("taskFollowModal"),
+  form: document.getElementById("taskFollowForm"),
+  hint: document.getElementById("taskFollowHint"),
+  name: document.getElementById("taskFollowName"),
+  brief: document.getElementById("taskFollowBrief"),
+  complex: document.getElementById("taskFollowComplex"),
+  error: document.getElementById("taskFollowError"),
+  submit: document.getElementById("taskFollowSubmit"),
+};
+
+tel.followBtn.addEventListener("click", () => {
+  const t = task.current;
+  if (!t) return;
+  tflEl.hint.textContent = L("tasks.followUpHintFor", { name: t.title });
+  tflEl.name.value = L("tasks.followUpDefaultName", { name: t.title });
+  tflEl.brief.value = "";
+  tflEl.complex.checked = false;
+  tflEl.error.hidden = true;
+  tflEl.modal.hidden = false;
+  tflEl.brief.focus();
+});
+
+tflEl.form.addEventListener("submit", async e => {
+  e.preventDefault();
+  const from = task.current;
+  if (!from) return;
+  tflEl.submit.disabled = true;
+  tflEl.error.hidden = true;
+  try {
+    const created = await api.createTask({ title: tflEl.name.value.trim(), brief: tflEl.brief.value.trim(),
+      kind: tflEl.complex.checked ? "complex" : "general", continuesFrom: from.id });
+    tflEl.modal.hidden = true;
+    openTask(created.id);
+  } catch (err) {
+    tflEl.error.textContent = err.message;
+    tflEl.error.hidden = false;
+  } finally {
+    tflEl.submit.disabled = false;
+  }
+});
+tflEl.modal.querySelectorAll("[data-close]").forEach(x => x.addEventListener("click", () => { tflEl.modal.hidden = true; }));
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !tflEl.modal.hidden) tflEl.modal.hidden = true; });

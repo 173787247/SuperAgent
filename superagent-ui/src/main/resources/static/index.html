@@ -17,8 +17,9 @@
     <nav class="topnav" aria-label="Main">
       <a class="nav__item" href="#todo" data-view="todo"><span data-i18n="nav.todo">To-do</span><span class="nav__badge" id="todoBadge" hidden></span></a>
       <a class="nav__item is-active" href="#chat" data-view="chat"><span data-i18n="nav.agents">Agents</span></a>
-      <a class="nav__item" href="#files" data-view="files"><span data-i18n="nav.files">Files</span></a>
       <a class="nav__item" href="#tasks" data-view="tasks"><span data-i18n="nav.tasks">Tasks</span></a>
+      <a class="nav__item" href="#automation" data-view="automation"><span data-i18n="nav.automation">Automation</span></a>
+      <a class="nav__item" href="#files" data-view="files"><span data-i18n="nav.files">Resources</span></a>
       <div class="topmenu" id="workspaceMenu">
         <button class="topmenu__btn" type="button" id="workspaceBtn" aria-haspopup="menu" aria-expanded="false">
           <span data-i18n="nav.workspace">Workspace</span><span class="topmenu__current" id="workspaceCurrent"></span>
@@ -26,8 +27,9 @@
         </button>
         <div class="topmenu__panel" role="menu">
           <nav class="nav" aria-label="Workspace">
-            <a class="nav__item" href="#skills" data-view="skills"><span class="nav__dot"></span><span data-i18n="nav.skills">Skills</span></a>
+            <a class="nav__item" href="#projects" data-view="projects"><span class="nav__dot"></span><span data-i18n="nav.projects">Projects</span></a>
             <a class="nav__item" href="#connectors" data-view="connectors"><span class="nav__dot"></span><span data-i18n="nav.connectors">Connectors</span></a>
+            <a class="nav__item" href="#skills" data-view="skills"><span class="nav__dot"></span><span data-i18n="nav.skills">Skills</span></a>
             <a class="nav__item" href="#usage" data-view="usage"><span class="nav__dot"></span><span data-i18n="nav.usage">Usage</span></a>
           </nav>
         </div>
@@ -92,7 +94,8 @@
           <input type="file" id="chatImageInput" multiple hidden />
           <div class="composer__actions">
             <select class="composer__model" id="statusHint" aria-label="Model"></select>
-            <button class="send" type="submit" id="sendBtn" aria-label="Send">↑</button>
+            <span class="composer__hint" data-i18n="chat.sendHint">⌘ Enter to send</span>
+            <button class="send" type="submit" id="sendBtn" aria-label="Send" data-i18n-title="chat.sendHint">↑</button>
           </div>
         </div>
       </form>
@@ -107,6 +110,8 @@
             <div class="agent-card__text">
               <h3 class="agent-card__name" id="agentInfoName">Agent</h3>
               <p class="agent-card__sub" id="agentInfoSub"></p>
+              <button type="button" class="agent-card__project" id="agentInfoProject" hidden></button>
+              <button type="button" class="agent-card__project agent-card__parent" id="agentInfoParent" hidden></button>
             </div>
           </div>
           <div class="agent-card__people" id="agentPeople" hidden>
@@ -160,34 +165,73 @@
         <button type="button" class="model-tab" data-filter="done"><span data-i18n="todo.tabDone">Done</span> <b></b></button>
         <button type="button" class="model-tab" data-filter="notice"><span data-i18n="todo.tabNotice">Notices</span> <b></b></button>
         <button type="button" class="model-tab" data-filter="ignored"><span data-i18n="todo.tabIgnored">Ignored</span> <b></b></button>
+        <button type="button" class="model-tab" data-filter="messages"><span data-i18n="todo.tabMessages">Messages</span> <b></b></button>
         <button class="link-btn todo-read-all" type="button" id="todoReadAll" data-i18n="todo.readAll">Mark all read</button>
       </div>
       <div class="admin__body">
+        <div id="todoItems">
         <table class="ctable todo-table"><thead><tr><th class="todo-col-kind" data-i18n="todo.colKind">Type</th><th data-i18n="todo.colItem">Item</th><th class="todo-col-from" data-i18n="todo.colFrom">From</th><th class="todo-col-time" data-i18n="todo.colTime">Updated</th><th class="ctable__actions-col"></th></tr></thead><tbody id="todoList"></tbody></table>
         <p class="kb-empty" id="todoEmpty" hidden></p>
+        </div>
+        <!-- The message stream: what Feishu / DingTalk brought to the user's SuperAgent, and what it did with each. -->
+        <div id="todoMessages" hidden>
+          <div class="ib-bar">
+            <select id="ibFilterPriority" aria-label="Priority"></select>
+            <select id="ibFilterHandling" aria-label="Handling"></select>
+          </div>
+          <table class="ctable ib-events">
+            <colgroup><col class="ib-c-from" /><col /><col class="ib-c-prio" /><col class="ib-c-handled" /><col class="ib-c-time" /></colgroup>
+            <thead><tr><th data-i18n="ib.colFrom">From</th><th data-i18n="ib.colText">Message</th><th data-i18n="ib.colPriority">Priority</th><th data-i18n="ib.colHandling">SuperAgent</th><th class="ib-time" data-i18n="ib.colTime">Received</th></tr></thead>
+            <tbody id="ibEvents"></tbody>
+          </table>
+          <p class="kb-empty" id="ibEventsEmpty" data-i18n="ib.eventsEmpty" hidden></p>
+        </div>
       </div>
     </section>
 
-    <!-- Outside messages that reached SuperAgent; opened from the SuperAgent panel, not the menu. -->
-    <section class="admin" data-pane="inbox" aria-label="Message stream" hidden>
-      <div class="admin__head">
-        <div>
-          <h2 class="admin__title" data-i18n="ib.title">Message stream</h2>
-          <p class="admin__sub" data-i18n="ib.sub">Messages from Feishu that reached your SuperAgent, and what it did with each.</p>
+    <!-- Projects: a set of agents and the people who use them; members see every task and file made in it. -->
+    <section class="admin" data-pane="projects" aria-label="Projects" hidden>
+      <div id="projListView">
+        <div class="admin__head">
+          <div>
+            <h2 class="admin__title" data-i18n="proj.title">Projects</h2>
+            <p class="admin__sub" data-i18n="proj.sub">Group agents for a piece of work and share them with everyone on it in one go.</p>
+          </div>
+          <button class="btn btn--primary" id="projNewBtn" type="button" data-i18n="proj.new">+ New project</button>
+        </div>
+        <div class="model-tabs page-tabs" id="projTabs" role="tablist">
+          <button type="button" class="model-tab is-active" data-state="active"><span data-i18n="proj.tabActive">Active</span> <b></b></button>
+          <button type="button" class="model-tab" data-state="archived"><span data-i18n="proj.tabArchived">Archived</span> <b></b></button>
+        </div>
+        <div class="admin__body">
+          <div class="proj-grid" id="projGrid"></div>
+          <p class="kb-empty" id="projEmpty" hidden></p>
         </div>
       </div>
-      <div class="admin__body">
-        <p class="ib-notice" id="ibNotLinked" hidden><span data-i18n="ib.notLinked">Your Feishu account isn't linked yet.</span>
-          <a href="#connectors" data-i18n="ib.goConnectors">Link it on the Connectors page →</a></p>
-        <div class="ib-filters">
-          <select id="ibFilterPriority" aria-label="Priority"></select>
-          <select id="ibFilterHandling" aria-label="Handling"></select>
+      <div id="projDetailView" hidden>
+        <div class="admin__head proj-head">
+          <div>
+            <button type="button" class="link-btn link-btn--muted proj-back" id="projBack" data-i18n="proj.back">← All projects</button>
+            <h2 class="admin__title"><span id="projName"></span> <span class="pill proj-state" id="projState"></span></h2>
+            <p class="admin__sub" id="projDesc"></p>
+          </div>
+          <div class="proj-head__actions">
+            <button class="btn btn--primary" id="projInviteBtn" type="button" data-i18n="proj.invite">+ Invite</button>
+            <button class="btn" id="projAddAgentBtn" type="button" data-i18n="proj.addAgent">+ Add Agent</button>
+            <button class="btn" id="projEditBtn" type="button" data-i18n="common.edit">Edit</button>
+            <button class="btn" id="projArchiveBtn" type="button" data-i18n="proj.reopen">Reopen</button>
+          </div>
         </div>
-        <table class="ctable ib-events">
-          <thead><tr><th data-i18n="ib.colSource">Source</th><th data-i18n="ib.colFrom">From</th><th data-i18n="ib.colText">Message</th><th data-i18n="ib.colPriority">Priority</th><th data-i18n="ib.colHandling">SuperAgent</th><th data-i18n="ib.colTime">Received</th></tr></thead>
-          <tbody id="ibEvents"></tbody>
-        </table>
-        <p class="kb-empty" id="ibEventsEmpty" data-i18n="ib.eventsEmpty" hidden></p>
+        <div class="model-tabs page-tabs" id="projDetailTabs" role="tablist">
+          <button type="button" class="model-tab is-active" data-tab="agents"><span data-i18n="proj.tabAgents">Agents</span> <b></b></button>
+          <button type="button" class="model-tab" data-tab="tasks"><span data-i18n="proj.tabTasks">Tasks</span> <b></b></button>
+          <button type="button" class="model-tab" data-tab="files"><span data-i18n="proj.tabFiles">Files</span> <b></b></button>
+          <button type="button" class="model-tab" data-tab="members"><span data-i18n="proj.tabMembers">Members</span> <b></b></button>
+        </div>
+        <div class="admin__body">
+          <table class="ctable proj-table"><tbody id="projRows"></tbody></table>
+          <p class="kb-empty" id="projRowsEmpty" hidden></p>
+        </div>
       </div>
     </section>
 
@@ -246,6 +290,7 @@
               <button type="button" class="model-tab" data-kind="other"><span data-i18n="fl.kindOther">Other</span> <b></b></button>
             </div>
             <div class="fl-toolbar">
+              <select id="flProject" aria-label="Project" data-i18n-title="proj.filterTitle" hidden></select>
               <select id="flAgent" aria-label="Agent"></select>
               <input type="search" id="flSearch" data-i18n-ph="fl.search" aria-label="Search files" />
               <button type="button" class="btn btn--sm" id="flNewMd" data-i18n="fl.newMd">New Markdown</button>
@@ -294,16 +339,17 @@
 
     <section class="admin" data-pane="tasks" aria-label="Tasks" hidden>
       <div class="task-list-view" id="taskListView">
-        <div class="work-stats" data-work-stats></div>
-        <div class="model-tabs page-tabs" role="tablist">
-          <button type="button" class="model-tab is-active" data-goto="tasks" data-i18n="tasks.tabTasks">Tasks</button>
-          <button type="button" class="model-tab" data-goto="automation" data-i18n="tasks.tabScheduled">Scheduled</button>
-        </div>
         <div class="admin__body">
+          <!-- Narrow the list by topic tag, with what the tag's tasks add up to. -->
+          <div class="task-filter" id="taskFilter">
+            <div class="tag-bar" id="taskTagBar" role="tablist" data-i18n-title="tasks.filterTag" aria-label="Tags"></div>
+            <span class="task-filter__sum" id="taskFilterSum"></span>
+          </div>
           <table class="ttable">
             <thead>
               <tr>
-                <th data-i18n="tasks.colTask">Task</th><th data-i18n="tasks.colAgent">Agent / Model</th>
+                <th data-i18n="tasks.colTask">Task</th><th class="t-col-kind" data-i18n="tasks.colKind">Type</th>
+                <th class="t-col-subs" data-i18n="tasks.colSubtasks">Subtasks</th><th data-i18n="tasks.colAgent">Agent / Model</th>
                 <th data-i18n="tasks.colSource">Source</th>
                 <th data-i18n="tasks.colCreated">Created</th><th data-i18n="tasks.colSpend">Spend</th>
                 <th class="ttable__status-col" data-i18n="tasks.colStatus">Status</th><th></th>
@@ -326,9 +372,11 @@
           <div class="task-detail__title-wrap">
             <h2 class="task-detail__title" id="taskDetailTitle">Task</h2>
             <div class="task-detail__meta" id="taskDetailMeta"></div>
+            <div class="task-detail__rel" id="taskDetailRel" hidden></div>
           </div>
           <span class="status-badge" id="taskDetailStatus">pending</span>
           <div class="task-detail__actions">
+            <button class="btn" id="taskFollowBtn" type="button" data-i18n="tasks.followUp" data-i18n-title="tasks.followUpHint" hidden>Carry on</button>
             <button class="btn" id="taskStopBtn" type="button" data-i18n="tasks.stop">Stop</button>
             <button class="btn" id="taskDeleteBtn" type="button" data-i18n="tasks.delete">Delete</button>
           </div>
@@ -340,7 +388,9 @@
               <button type="button" class="model-tab" data-tab="model" data-i18n="tasks.tabModel">Model choice</button>
               <button type="button" class="model-tab is-active" data-tab="run" data-i18n="tasks.tabRun">Conversation</button>
               <button type="button" class="model-tab" data-tab="output" data-i18n="tasks.tabOutput">Output</button>
+              <button type="button" class="model-tab" data-tab="subtasks" id="taskSubtasksTab" hidden>Subtasks</button>
               <button type="button" class="model-tab" data-tab="usage" data-i18n="tasks.tabUsage">Cost</button>
+              <button type="button" class="model-tab" data-tab="timing" data-i18n="tm.tab">Time</button>
               <button type="button" class="model-tab" data-tab="session" data-i18n="tasks.tabSession">Session</button>
             </div>
             <div class="task-pane" data-pane-tab="prompt" hidden>
@@ -356,12 +406,20 @@
               </section>
               <h3 class="task-section__title" data-i18n="tasks.runlog">Run log</h3>
               <div class="task-stream" id="taskStream"></div>
+              <p class="task-live" id="taskLive" hidden></p>
             </div>
             <div class="task-pane" data-pane-tab="output" hidden>
               <div class="task-output markdown" id="taskOutput"></div>
             </div>
+            <div class="task-pane" data-pane-tab="subtasks" hidden>
+              <p class="subtasks__sum" id="taskSubtasksSum"></p>
+              <div class="subtasks" id="taskSubtasks"></div>
+            </div>
             <div class="task-pane" data-pane-tab="usage" hidden>
               <div class="task-usage" id="taskUsage"></div>
+            </div>
+            <div class="task-pane" data-pane-tab="timing" hidden>
+              <div class="tm-task" id="taskTiming"></div>
             </div>
             <div class="task-pane" data-pane-tab="session" hidden>
               <dl class="task-facts session-facts" id="taskSessionInfo"></dl>
@@ -373,6 +431,12 @@
             <div class="progress"><div class="progress__bar" id="taskProgressBar"></div></div>
             <p class="progress__pct" id="taskProgressPct">0%</p>
             <dl class="task-facts" id="taskFacts"></dl>
+            <h3 class="panel__title panel__title--spaced" data-i18n="tasks.tags">Tags</h3>
+            <div class="task-tags" id="taskTags"></div>
+            <div class="task-follow" id="taskFollowList" hidden>
+              <h3 class="panel__title panel__title--spaced" data-i18n="tasks.followUps">Carried on in</h3>
+              <ul class="task-follow__list" id="taskFollowUps"></ul>
+            </div>
             <h3 class="panel__title panel__title--spaced" data-i18n="tasks.files">Files</h3>
             <ul class="task-files" id="taskFiles"></ul>
             <p class="artifact-empty" id="taskFilesEmpty" data-i18n="tasks.filesEmpty" hidden>No files yet.</p>
@@ -464,6 +528,7 @@
             <div class="fl-kinds" id="usKinds" role="tablist">
               <button type="button" class="model-tab is-active" data-kind="agents" data-i18n-title="us.hintAgents"><span data-i18n="us.kindAgents">Agents</span> <b id="usAgentsCount"></b></button>
               <button type="button" class="model-tab" data-kind="tasks" data-i18n-title="us.hintTasks"><span data-i18n="us.kindTasks">Tasks</span> <b id="usTasksCount"></b></button>
+              <button type="button" class="model-tab" data-kind="system" id="usSystemTab" data-i18n-title="us.hintSystem" hidden><span data-i18n="us.kindSystem">System background</span> <b id="usSystemCount"></b></button>
             </div>
           </div>
           <div class="us-card" id="usDetail"></div>
@@ -753,7 +818,21 @@
             <p class="field-hint" id="sfAgentModelHint" data-i18n="settings.agentModelHint"></p>
             <p class="field-hint" id="sfAgentModelMissing" data-i18n="settings.modelsMissing" hidden></p>
             <p class="field-hint" id="sfAgentModelFiltered" hidden></p>
+            <div class="field backup-models">
+              <span data-i18n="settings.backupModels">Backup models</span>
+              <div class="backup-models__list" id="sfBackupList"></div>
+              <select id="sfBackupAdd" aria-label="Add a backup model"></select>
+            </div>
+            <p class="field-hint" data-i18n="settings.backupHint">If the default model can't run, conversations quietly use these, in order, and come back by themselves once it works.</p>
           </div>
+          <h3 class="settings-form__section" data-i18n="settings.sectionComplex">Complex tasks</h3>
+          <div class="field-row">
+            <label class="field"><span data-i18n="settings.complexMaxSubtasks">Most subtasks</span>
+              <input type="number" id="sfComplexMaxSubtasks" min="1" max="50" step="1" /></label>
+            <label class="field"><span data-i18n="settings.complexMaxParallel">Running at once</span>
+              <input type="number" id="sfComplexMaxParallel" min="1" max="20" step="1" /></label>
+          </div>
+          <p class="field-hint" data-i18n="settings.complexHint">A complex task splits its work into subtasks that run side by side, then sums up. These cap how many it may hand out and how many run at the same time.</p>
           <div class="settings-form__actions">
             <button type="submit" class="btn btn--primary" data-i18n="common.save">Save</button>
             <span class="settings-form__status" id="sfStatus" role="status"></span>
@@ -764,29 +843,24 @@
 
     <section class="admin" data-pane="automation" aria-label="Automations" hidden>
       <div class="task-list-view" id="autoListView">
-        <div class="work-stats" data-work-stats></div>
-        <div class="model-tabs page-tabs" role="tablist">
-          <button type="button" class="model-tab" data-goto="tasks" data-i18n="tasks.tabTasks">Tasks</button>
-          <button type="button" class="model-tab is-active" data-goto="automation" data-i18n="tasks.tabScheduled">Scheduled</button>
-        </div>
 
+        <!-- Narrow the list on the left; the one action on the right. -->
         <div class="auto-toolbar">
-          <!-- Filtering moved to the shared stat cards above; kept hidden because the list code still reads it. -->
-          <div class="auto-tabs" id="autoTabs" role="tablist" hidden>
-            <button type="button" class="auto-tab is-active" data-filter="all"><span data-i18n="auto.tabAll">All</span> <b></b></button>
-            <button type="button" class="auto-tab" data-filter="active"><span data-i18n="auto.tabActive">Active</span> <b></b></button>
-            <button type="button" class="auto-tab" data-filter="once"><span data-i18n="auto.typeOnce">One-time</span> <b></b></button>
-            <button type="button" class="auto-tab" data-filter="recurring"><span data-i18n="auto.typeRecurring">Recurring</span> <b></b></button>
-            <button type="button" class="auto-tab" data-filter="api" id="autoTabApi" hidden><span data-i18n="auto.typeApi">API</span> <b></b></button>
-          </div>
           <div class="auto-filters">
             <input type="search" id="autoSearch" data-i18n-ph="auto.search" aria-label="Search automations" />
+            <select id="autoTypeFilter" aria-label="Type">
+              <option value="all" data-i18n="auto.tabAll">All</option>
+              <option value="active" data-i18n="auto.tabActive">Active</option>
+              <option value="once" data-i18n="auto.typeOnce">One-time</option>
+              <option value="recurring" data-i18n="auto.typeRecurring">Recurring</option>
+              <option value="api" id="autoTypeApi" data-i18n="auto.typeApi" hidden>API</option>
+            </select>
             <select id="autoOwnerFilter" aria-label="Creator">
               <option value="mine" data-i18n="auto.ownerMine">My automations</option>
               <option value="all" data-i18n="auto.ownerAll">Everyone's</option>
             </select>
-            <button class="btn btn--primary" id="autoAddBtn" type="button" data-i18n="auto.add">+ New scheduled task</button>
           </div>
+          <button class="btn btn--primary" id="autoAddBtn" type="button" data-i18n="auto.add">+ New scheduled task</button>
         </div>
         <div class="admin__body">
           <table class="ctable">
@@ -954,14 +1028,10 @@
     <form class="modal__card" id="intForm">
       <h3 class="modal__title" id="intModalTitle"></h3>
       <div class="conn-section" id="intFields"></div>
-      <!-- Folded: only needed once, when creating the app on the other side. -->
-      <details class="settings-advanced" id="intHelp">
-        <summary id="intHelpSummary"></summary>
-        <p class="field-hint" id="intHint"></p>
-        <label class="field" id="intCallbackField"><span data-i18n="int.callback">Callback URL</span>
-          <input type="text" id="intCallback" readonly />
-          <small class="field-hint" data-i18n="int.callbackHint"></small></label>
-      </details>
+      <label class="field" id="intCallbackField"><span data-i18n="int.callback">Callback URL</span>
+        <input type="text" id="intCallback" readonly />
+        <small class="field-hint" data-i18n="int.callbackHint"></small></label>
+      <button type="button" class="link-btn int-guide-link" id="intGuideLink" data-i18n="int.guideOpen">Where do I get these? Setup guide →</button>
       <label class="check-field"><input type="checkbox" id="intEnabled" /><span data-i18n="int.enabled">Enabled</span></label>
       <p class="field-hint kb-modal__error" id="intError" hidden></p>
       <div class="modal__actions">
@@ -969,6 +1039,18 @@
         <button type="submit" class="btn btn--primary" id="intSubmit" data-i18n="common.save">Save</button>
       </div>
     </form>
+  </div>
+
+  <!-- How to create an integration's app on the other side, step by step. -->
+  <div class="drawer" id="intGuide" hidden>
+    <div class="drawer__backdrop" data-close></div>
+    <div class="drawer__panel">
+      <div class="drawer__head">
+        <button type="button" class="drawer__close" data-close aria-label="Close">×</button>
+        <h3 class="drawer__title" id="intGuideTitle"></h3>
+      </div>
+      <div class="drawer__body int-guide" id="intGuideBody"></div>
+    </div>
   </div>
 
   <div class="modal" id="connectorModal" hidden>
@@ -1017,11 +1099,48 @@
   </div>
 
   <!-- An employee's own token for a connector that acts as each person. -->
+  <!-- A connector's capabilities: the tools its MCP server lists for the viewer's own authorization. -->
+  <div class="drawer" id="connToolsDrawer" hidden>
+    <div class="drawer__backdrop" data-close></div>
+    <div class="drawer__panel drawer__panel--wide">
+      <div class="drawer__head">
+        <button type="button" class="drawer__close" data-close aria-label="Close">×</button>
+        <h3 class="drawer__title" id="connToolsTitle"></h3>
+        <div class="kb__actions">
+          <button class="btn btn--sm" type="button" id="connToolsRefresh" data-i18n="conn.toolsRefresh">Refresh</button>
+        </div>
+      </div>
+      <div class="drawer__body">
+        <p class="ct-meta" id="connToolsMeta"></p>
+        <div class="ct-list" id="connToolsList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- A new task that carries on from the open one: it starts from that task's conclusion. -->
+  <div class="modal" id="taskFollowModal" hidden>
+    <div class="modal__backdrop" data-close></div>
+    <form class="modal__card" id="taskFollowForm">
+      <h3 class="modal__title" data-i18n="tasks.followUpTitle">Carry on from this task</h3>
+      <p class="field-hint" id="taskFollowHint"></p>
+      <label class="field"><span data-i18n="tasks.followUpName">Title</span><input type="text" id="taskFollowName" maxlength="200" required /></label>
+      <label class="field"><span data-i18n="tasks.followUpBrief">What to do next</span><textarea id="taskFollowBrief" rows="6" required data-i18n-ph="tasks.followUpBriefPh"></textarea></label>
+      <label class="check-field"><input type="checkbox" id="taskFollowComplex" /><span data-i18n="tasks.followUpComplex">Complex: split it into subtasks that run side by side</span></label>
+      <p class="field-hint kb-modal__error" id="taskFollowError" hidden></p>
+      <div class="modal__actions">
+        <button type="button" class="btn" data-close data-i18n="common.cancel">Cancel</button>
+        <button type="submit" class="btn btn--primary" id="taskFollowSubmit" data-i18n="tasks.followUpGo">Start</button>
+      </div>
+    </form>
+  </div>
+
   <div class="modal" id="connTokenModal" hidden>
     <div class="modal__backdrop" data-close></div>
     <form class="modal__card" id="connTokenForm">
       <h3 class="modal__title" id="connTokenTitle"></h3>
-      <p class="field-hint" data-i18n="conn.tokenHint"></p>
+      <p class="field-hint" id="connTokenHint" data-i18n="conn.tokenHint"></p>
+      <p class="field-hint" id="connTokenWhere" hidden><a id="connTokenLink" target="_blank" rel="noopener noreferrer"></a></p>
+      <label class="field" id="connTokenAccountField" hidden><span data-i18n="conn.accountEmail">Email</span><input type="email" id="connTokenAccount" autocomplete="username" /></label>
       <label class="field"><span>Token</span><input type="password" id="connTokenInput" autocomplete="new-password" required /></label>
       <p class="field-hint kb-modal__error" id="connTokenError" hidden></p>
       <div class="modal__actions">
@@ -1050,6 +1169,7 @@
       </section>
       <form class="account-section" id="acPasswordForm">
         <h4 class="account-section__title" data-i18n="account.password">Password</h4>
+        <p class="account-forced" id="acForced" data-i18n="account.forced" hidden>You signed in with a password someone else set. Choose your own to continue.</p>
         <p class="field-hint" id="acPasswordNone" hidden></p>
         <div id="acPasswordFields">
           <label class="field"><span data-i18n="account.current">Current password</span>
@@ -1114,6 +1234,37 @@
     </form>
   </div>
 
+  <div class="modal" id="projModal" hidden>
+    <div class="modal__backdrop" data-close></div>
+    <form class="modal__card" id="projForm">
+      <h3 class="modal__title" id="projModalTitle"></h3>
+      <label class="field"><span data-i18n="proj.name">Name</span><input type="text" id="projFormName" maxlength="80" required /></label>
+      <label class="field"><span data-i18n="proj.desc">What it's for</span><textarea id="projFormDesc" rows="3" data-i18n-ph="proj.descPh"></textarea></label>
+      <p class="field-hint kb-modal__error" id="projFormError" hidden></p>
+      <div class="modal__actions proj-modal__actions">
+        <button type="button" class="btn proj-modal__archive" id="projFormArchive" data-i18n="proj.archiveProject" hidden>Archive project</button>
+        <button type="button" class="btn" data-close data-i18n="common.cancel">Cancel</button>
+        <button type="submit" class="btn btn--primary" id="projFormSubmit" data-i18n="common.save">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Picking colleagues or agents to add to a project. -->
+  <div class="modal" id="projPickModal" hidden>
+    <div class="modal__backdrop" data-close></div>
+    <form class="modal__card" id="projPickForm">
+      <h3 class="modal__title" id="projPickTitle"></h3>
+      <p class="field-hint" id="projPickHint"></p>
+      <input type="search" class="invite-search" id="projPickSearch" data-i18n-ph="co.searchPh" />
+      <div class="invite-list" id="projPickList"></div>
+      <p class="field-hint kb-modal__error" id="projPickError" hidden></p>
+      <div class="modal__actions">
+        <button type="button" class="btn" data-close data-i18n="common.cancel">Cancel</button>
+        <button type="submit" class="btn btn--primary" id="projPickSubmit" data-i18n="proj.add">Add</button>
+      </div>
+    </form>
+  </div>
+
   <div class="modal" id="kbModal" hidden>
     <div class="modal__backdrop" data-close></div>
     <form class="modal__card" id="kbForm">
@@ -1137,11 +1288,17 @@
     <div class="modal__backdrop" data-close></div>
     <form class="modal__card" id="agentForm">
       <h3 class="modal__title" id="agentModalTitle" data-i18n="agent.modalAdd">New Agent</h3>
-      <div class="field"><span data-i18n="agent.fAvatar">Avatar</span>
-        <div class="avatar-picker" id="afAvatars" role="radiogroup"></div>
+      <div class="field"><label for="afName" data-i18n="agent.fName">Name</label>
+        <!-- One avatar, picked at random: click it to choose another, or shuffle. -->
+        <div class="name-row">
+          <button type="button" class="avatar-current" id="afAvatarBtn" aria-expanded="false" data-i18n-title="agent.avatarPick"></button>
+          <input type="text" id="afName" required data-i18n-ph="agent.fNamePh" />
+          <button type="button" class="avatar-shuffle" id="afAvatarShuffle" data-i18n-title="agent.avatarShuffle">↻</button>
+        </div>
+        <div class="avatar-picker" id="afAvatars" role="radiogroup" hidden></div>
       </div>
-      <label class="field"><span data-i18n="agent.fName">Name</span>
-        <input type="text" id="afName" required data-i18n-ph="agent.fNamePh" />
+      <label class="field" id="afProjectField"><span data-i18n="proj.fProject">Project</span>
+        <select id="afProject"></select>
       </label>
       <label class="field"><span data-i18n="agent.fCharacter">Character</span>
         <select id="afCharacter"></select>
@@ -1154,8 +1311,9 @@
         </div>
       </div>
       <label class="field"><span id="afPersonaLabel"></span>
-        <textarea id="afPersona" rows="4"></textarea>
+        <textarea id="afPersona" rows="8"></textarea>
       </label>
+      <p class="field-hint" data-i18n="agent.fPersonaSkillHint">Steps it repeats, or ones several agents share, work better as a Skill attached above.</p>
       <div class="modal__actions">
         <button type="button" class="btn" data-close data-i18n="common.cancel">Cancel</button>
         <button type="submit" class="btn btn--primary" id="afSubmit" data-i18n="common.save">Save</button>
@@ -1177,6 +1335,10 @@
       <div class="drawer__body" id="agentInfoDetails">
         <!-- What's beneath the conversation: what it remembers, and what it did. -->
         <div class="agent-links">
+          <button class="agent-link" id="agentPromptsBtn" type="button">
+            <span class="agent-link__icon" aria-hidden="true">✎</span>
+            <span class="agent-link__text"><b data-i18n="log.catPrompts">Prompts</b><small data-i18n="log.promptsLinkHint">Everything sent to it, to read or download</small></span>
+          </button>
           <button class="agent-link" id="agentMemoryBtn" type="button">
             <span class="agent-link__icon" aria-hidden="true">◎</span>
             <span class="agent-link__text"><b data-i18n="mem.open">Memory</b><small data-i18n="mem.linkHint">What it carries into every new conversation</small></span>
@@ -1185,10 +1347,6 @@
             <span class="agent-link__icon" aria-hidden="true">≡</span>
             <span class="agent-link__text"><b data-i18n="log.open">Run log</b><small data-i18n="log.linkHint">Sessions, turns and what it did in the background</small></span>
           </button>
-          <a class="agent-link" id="superSources" href="#messages" hidden>
-            <span class="agent-link__icon" aria-hidden="true">✉</span>
-            <span class="agent-link__text"><b data-i18n="super.messagesLink">Message stream</b><small id="superSourcesHint"></small></span>
-          </a>
         </div>
         <div class="agent-field agent-members" id="agentMembersBlock" hidden>
           <div class="agent-field__head">
@@ -1205,6 +1363,14 @@
             <p class="agent-info__persona" id="agentInfoPersona"></p>
             <button class="agent-persona__more" type="button" id="agentPersonaMore" hidden></button>
           </div>
+        </div>
+        <div class="agent-field agent-field--not-super" id="agentDetailProjectField">
+          <span class="agent-field__label" data-i18n="proj.fProject">Project</span>
+          <p class="agent-info__model" id="agentDetailProject"></p>
+        </div>
+        <div class="agent-field agent-field--not-super" id="agentDetailParentField">
+          <span class="agent-field__label" data-i18n="agent.parent">Reports to</span>
+          <p class="agent-info__model" id="agentDetailParent"></p>
         </div>
         <div class="agent-field agent-field--not-super">
           <span class="agent-field__label" data-i18n="sk.agentSkills">Skills</span>
@@ -1247,6 +1413,25 @@
     </div>
   </div>
 
+  <!-- Everything sent to an agent, across its sessions: one line each, the whole text on a click, all of it as a file. -->
+  <div class="drawer" id="agentPromptDrawer" hidden>
+    <div class="drawer__backdrop" data-close></div>
+    <div class="drawer__panel drawer__panel--wide">
+      <div class="drawer__head">
+        <button type="button" class="drawer__close" data-close aria-label="Close">×</button>
+        <h3 class="drawer__title" id="agentPromptTitle">Prompts</h3>
+      </div>
+      <div class="drawer__body">
+        <div class="prompt-log__head">
+          <span class="prompt-log__count" id="agentPromptCount"></span>
+          <button type="button" class="btn" id="agentPromptDownload" data-i18n="log.promptsDownload">Download all</button>
+        </div>
+        <ol class="log-list" id="agentPromptList"></ol>
+        <p class="admin__empty" id="agentPromptEmpty" data-i18n="log.promptsEmpty" hidden>Nothing has been sent to this agent yet.</p>
+      </div>
+    </div>
+  </div>
+
   <div class="drawer" id="agentLogDrawer" hidden>
     <div class="drawer__backdrop" data-close></div>
     <div class="drawer__panel drawer__panel--wide">
@@ -1265,6 +1450,7 @@
           </div>
           <button type="button" class="super-work__all log-refresh" id="agentLogRefresh" data-i18n="log.refresh">Refresh</button>
         </div>
+        <ol class="sess-list" id="agentSessList" hidden></ol>
         <ol class="log-list" id="agentLogList"></ol>
         <p class="admin__empty" id="agentLogEmpty" data-i18n="log.empty" hidden>Nothing logged yet.</p>
         <p class="log-note" data-i18n="log.retention">Kept for 30 days, up to 5000 lines per agent.</p>
@@ -1392,6 +1578,7 @@
   <script src="/js/superagent.js"></script>
   <script src="/js/skill-cards.js"></script>
   <script src="/js/agent-log.js"></script>
+  <script src="/js/agent-prompts.js"></script>
   <script src="/js/memory.js"></script>
   <script src="/js/files.js"></script>
   <script src="/js/file-folders.js"></script>
@@ -1401,7 +1588,9 @@
   <script src="/js/inbox.js"></script>
   <script src="/js/skills.js"></script>
   <script src="/js/connectors.js"></script>
+  <script src="/js/projects.js"></script>
   <script src="/js/tasks.js"></script>
+  <script src="/js/timing.js"></script>
   <script src="/js/auth.js"></script>
   <script src="/js/models.js"></script>
   <script src="/js/settings.js"></script>

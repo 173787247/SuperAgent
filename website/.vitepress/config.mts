@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 const base = '/SuperAgent/'
 const siteUrl = 'https://oryx-labs.github.io/SuperAgent/'
 const github = 'https://github.com/oryx-labs/SuperAgent'
-const demo = 'http://117.72.92.117:18081/login'
+const demo = 'http://superagent.robustmq.com'
 
 export default defineConfig({
   title: 'SuperAgent',
@@ -58,6 +58,7 @@ export default defineConfig({
               items: [
                 { text: 'What is SuperAgent', link: '/docs/what' },
                 { text: 'Why SuperAgent', link: '/docs/why' },
+                { text: 'Architecture', link: '/docs/architecture' },
               ],
             },
             {
@@ -108,6 +109,7 @@ export default defineConfig({
               items: [
                 { text: 'SuperAgent 是什么', link: '/zh/docs/what' },
                 { text: '为什么选 SuperAgent', link: '/zh/docs/why' },
+                { text: '技术架构', link: '/zh/docs/architecture' },
               ],
             },
             {

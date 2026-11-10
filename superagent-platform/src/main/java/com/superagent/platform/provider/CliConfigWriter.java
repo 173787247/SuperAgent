@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.superagent.core.chat.RunCredential;
+import com.superagent.core.tenant.Company;
+import com.superagent.core.tenant.TenantContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -60,12 +62,14 @@ public class CliConfigWriter {
     });
 
     public CliConfigWriter(CredentialService credentials, MachineCredentials machine,
-                           @Value("${superagent.provider.cli-config.enabled:true}") boolean enabled) {
+                           @Value("${superagent.provider.cli-config.enabled:false}") boolean enabled) {
         this.credentials = credentials;
         this.machine = machine;
         this.enabled = enabled;
         if (enabled) {
-            credentials.onSwitch("cli-config", key -> writer.execute(() -> apply(key)));
+            // Off by default: runs get their company's key directly, and the machine's CLI config is no company's.
+            // On (a single-company machine), the last key switch of any company lands in it.
+            credentials.onSwitch("cli-config", key -> writer.execute(TenantContext.wrap(() -> apply(key))));
         }
     }
 

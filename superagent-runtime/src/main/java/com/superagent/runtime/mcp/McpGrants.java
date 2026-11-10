@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.superagent.core.connector.ConnectorTransport;
 import com.superagent.core.connector.McpServerSpec;
+import com.superagent.core.tenant.Company;
+import com.superagent.core.tenant.TenantContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -84,8 +86,37 @@ public class McpGrants {
     /** Deleting a skill needs a card the user confirms, so only conversations get it (not tasks). */
     public static final List<String> SKILL_CHAT_TOOLS = List.of("mcp__superagent__skill_delete");
 
+    /** Office document tools (Feishu / Lark, DingTalk; each only once its app is set up) and reading any link. */
+    public static final List<String> DOC_TOOLS = java.util.stream.Stream.of("feishu_doc_search", "feishu_doc_list",
+            "feishu_doc_read", "feishu_doc_create", "feishu_doc_append", "feishu_doc_replace", "dingtalk_doc_spaces",
+            "dingtalk_doc_list", "dingtalk_doc_read", "dingtalk_doc_create", "dingtalk_doc_replace", "read_link")
+            .map(n -> "mcp__superagent__" + n).toList();
+
+    /** The reading half: the SuperAgent's chat looks things up itself and hands writing to its team. */
+    public static final List<String> DOC_READ_TOOLS = java.util.stream.Stream.of("feishu_doc_search", "feishu_doc_list",
+            "feishu_doc_read", "dingtalk_doc_spaces", "dingtalk_doc_list", "dingtalk_doc_read", "read_link")
+            .map(n -> "mcp__superagent__" + n).toList();
+
+    /** Whether a run may call this office document tool: the SuperAgent's chat only reads, its background never. */
+    public static void requireDocAccess(Grant grant, String tool) {
+        if (grant.kind() != Kind.SUPER) {
+            return;
+        }
+        if (grant.sessionId() == null) {
+            throw new McpToolException("后台处理不能读写用户的文档。");
+        }
+        if (!DOC_READ_TOOLS.contains("mcp__superagent__" + tool)) {
+            throw new McpToolException("SuperAgent 只读文档；新建或修改文档请用 start_task 交给成员去做。");
+        }
+    }
+
     /** File and skill tool names, for chat and task allowlists. */
-    public static final List<String> WORK_TOOLS = java.util.stream.Stream.concat(FILE_TOOLS.stream(), SKILL_TOOLS.stream()).toList();
+    /** The agent's past conversation (agent.chat.ChatHistoryMcpTools), for its chats and its tasks. */
+    public static final List<String> HISTORY_TOOLS = List.of("mcp__superagent__chat_history_search",
+            "mcp__superagent__chat_history_read");
+
+    public static final List<String> WORK_TOOLS = java.util.stream.Stream.of(FILE_TOOLS, SKILL_TOOLS, DOC_TOOLS, HISTORY_TOOLS)
+            .flatMap(List::stream).toList();
 
     /**
      * Told to every chat and task run that has the file tools: work results go to the user through them.
@@ -107,6 +138,10 @@ public class McpGrants {
     private static final Logger log = LoggerFactory.getLogger(McpGrants.class);
 
     private final Map<String, Grant> grants = new ConcurrentHashMap<>();
+    /** The company each open grant's run belongs to; its tool calls run as that company. */
+    private final Map<String, String> companies = new ConcurrentHashMap<>();
+    /** A CLI kept running between turns holds the token it started with: during a turn it stands for that turn's. */
+    private final Map<String, String> standIns = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
     private final ObjectMapper mapper = new ObjectMapper();
     /** Set explicitly (a proxy, another host); otherwise found from the port the server actually listens on. */
@@ -157,7 +192,9 @@ public class McpGrants {
     @EventListener(ApplicationReadyEvent.class)
     public void selfCheck() {
         Thread t = new Thread(() -> {
-            Grant probe = open(Kind.CHAT, "__selfcheck__", null, null, null, null, null);
+            // A ping touches no company's data; the grant still needs one.
+            Grant probe = TenantContext.call(Company.DEFAULT_ID,
+                    () -> open(Kind.CHAT, "__selfcheck__", null, null, null, null, null));
             try {
                 HttpRequest req = HttpRequest.newBuilder(URI.create(selfUrl)).timeout(Duration.ofSeconds(10))
                         .header("Content-Type", "application/json").header("Authorization", "Bearer " + probe.token())
@@ -213,6 +250,7 @@ public class McpGrants {
         byte[] bytes = new byte[24];
         random.nextBytes(bytes);
         Grant grant = new Grant(HexFormat.of().formatHex(bytes), kind, owner, taskId, agentId, sessionId, messageId, workspace);
+        companies.put(grant.token(), TenantContext.require());
         grants.put(grant.token(), grant);
         return grant;
     }
@@ -220,11 +258,57 @@ public class McpGrants {
     public void close(Grant grant) {
         if (grant != null) {
             grants.remove(grant.token());
+            companies.remove(grant.token());
         }
     }
 
     public Optional<Grant> find(String token) {
-        return token == null ? Optional.empty() : Optional.ofNullable(grants.get(token));
+        if (token == null) {
+            return Optional.empty();
+        }
+        Grant grant = grants.get(token);
+        if (grant == null) {
+            String current = standIns.get(token);
+            grant = current == null ? null : grants.get(current);
+        }
+        return Optional.ofNullable(grant);
+    }
+
+    /**
+     * Lets {@code standing} (the token a running CLI was started with) act as {@code current} (this turn's grant)
+     * until {@link #release}. Between turns it stands for nothing, so an idle CLI can't call anything.
+     */
+    public void standIn(String standing, String current) {
+        if (!standing.equals(current)) {
+            standIns.put(standing, current);
+        }
+    }
+
+    public void release(String standing) {
+        standIns.remove(standing);
+    }
+
+    /** The bearer token for SuperAgent's own server in an {@code --mcp-config} JSON, or null. */
+    public static String tokenIn(String mcpConfig) {
+        if (mcpConfig == null || mcpConfig.isBlank()) {
+            return null;
+        }
+        try {
+            String auth = new ObjectMapper().readTree(mcpConfig).path("mcpServers").path("superagent").path("headers")
+                    .path("Authorization").asText("");
+            return auth.startsWith("Bearer ") ? auth.substring(7) : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** The company {@code grant}'s run belongs to. */
+    public String companyOf(Grant grant) {
+        String company = companies.get(grant.token());
+        if (company == null) {
+            throw new IllegalStateException("MCP grant has no company: it was closed or not opened here");
+        }
+        return company;
     }
 
     /** Claude-style {@code --mcp-config} JSON; the Codex runner translates it to {@code -c mcp_servers.*}. */
